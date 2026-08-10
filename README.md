@@ -1,2 +1,3 @@
-# experiments
-Experimental filters and features for Praxis
+# Praxis Experiments
+
+Experimental filters and features for Praxis.
