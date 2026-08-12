@@ -1,3 +1,3 @@
 # Praxis Experiments
 
-Experimental filters and features for Praxis.
+Experimental filters, features and builds for Praxis.
