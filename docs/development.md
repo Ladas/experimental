@@ -2,8 +2,16 @@
 
 ## Requirements
 
-- Rust stable 1.94+
+- Rust stable 1.96+
 - Rust nightly (for `rustfmt`)
+- `cargo-machete` (unused dependency detection)
+- `cargo-audit`, `cargo-deny` (supply chain safety)
+- `cargo-llvm-cov` (coverage)
+- `cargo-semver-checks` (SemVer compliance, optional)
+- `cargo-mutants` (mutation testing, optional)
+- `cargo-hack` (feature matrix checks, optional)
+- `typos`, `taplo`, `shellcheck`, `actionlint`
+  (non-Rust lint, required by `make lint`)
 
 ## Conventions
 
@@ -27,6 +35,7 @@ make check
 
 ```console
 make test
+make mutants        # mutation testing (cargo-mutants)
 ```
 
 ### Supply Chain Safety
@@ -74,7 +83,26 @@ make coverage       # HTML coverage report
 make coverage-check # fail if below threshold
 ```
 
-Requires `cargo-llvm-cov`.
+Requires `cargo-llvm-cov`. The gate fails below **90%
+line coverage or 80% region coverage**. Region coverage
+counts each branch of each condition, so untested error
+paths fail the gate even when every line executes.
+
+### SemVer Compliance
+
+```console
+make semver         # cargo semver-checks
+```
+
+Requires `cargo-semver-checks`. Run before releases to
+catch breaking API changes that were not reflected in
+the version bump.
+
+## Releases
+
+See [release.md](./release.md) for versioning, the
+pre-release checklist, tagging, container publishing,
+and the release pipeline.
 
 ## Project Management
 
