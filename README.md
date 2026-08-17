@@ -21,7 +21,7 @@ commands.
 
 ## Demos
 
-See [demo/README.md](demo/README.md) for the index of experimental demos.
+See [demos/README.md](demos/README.md) for the index of experimental demos.
 
 ## License
 

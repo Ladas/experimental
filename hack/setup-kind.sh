@@ -17,7 +17,6 @@ CLUSTER_NAME="${KIND_CLUSTER_NAME:-praxis-dev}"
 GWAPI_VERSION="${GWAPI_VERSION:-v1.5.1}"
 METALLB_VERSION="${METALLB_VERSION:-v0.14.9}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 KUBECTL="kubectl --context kind-${CLUSTER_NAME}"
 
 # ---------------------------------------------------------------------------
@@ -65,7 +64,7 @@ configure_metallb_pool() {
     SUBNET=$(docker network inspect kind \
         -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' \
         | tr ' ' '\n' | grep '\.' | head -1)
-    IFS='.' read -r a b c d <<< "${SUBNET%%/*}"
+    IFS='.' read -r a b _ _ <<< "${SUBNET%%/*}"
     cat <<EOF | ${KUBECTL} apply -f -
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool

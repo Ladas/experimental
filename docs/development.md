@@ -127,7 +127,7 @@ should have exactly one priority label:
 | Label | Description |
 | --- | --- |
 | `priority/critical` | Must be worked on immediately before anything else |
-| `priority/high` | Needs to be worked on immediately, defer to criticals |
+| `priority/high` | Needs to be worked on immediately, defer to critical |
 | `priority/medium` | Resolve after high and critical |
 | `priority/low` | Resolve after all other priority levels |
 
