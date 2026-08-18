@@ -4,4 +4,4 @@ Demonstrations of experimental Praxis features live in this directory.
 
 ## Available Demos
 
-No demos have been added yet.
+- [Distributed token rate limiting with Grid routing](grid-distributed-token-rate-limit/README.md)
