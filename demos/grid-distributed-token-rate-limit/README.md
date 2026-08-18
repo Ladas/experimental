@@ -15,6 +15,10 @@ selection contract.
 > deployment contract. Configuration, APIs, ownership boundaries, and runtime
 > behavior are expected to evolve as the proposals are reviewed and the work is
 > implemented in the appropriate upstream components.
+>
+> Expect the deployment to require some hands-on troubleshooting. Several
+> components and their integration contracts are still carried on out-of-tree
+> development branches rather than coordinated releases.
 
 <!-- markdownlint-disable-next-line MD034 -->
 https://github.com/user-attachments/assets/7d72e292-8183-4a25-aadb-995c9578efb4
@@ -23,7 +27,8 @@ https://github.com/user-attachments/assets/7d72e292-8183-4a25-aadb-995c9578efb4
 
 - Basic authentication publishes a trusted `identity.user_id` only after the
   credentials have been verified.
-- Both consumer gateways enforce the same Alice/model token ledger.
+- A shared Valkey ledger lets a horizontally scaled fleet of consumer gateways
+  enforce one Alice/model quota instead of multiplying the quota per replica.
 - An admitted request is routed to the west, central, or east provider gateway.
 - Provider selection rotates across the active Grid group without calling Grid
   or Valkey for the routing decision.
@@ -63,31 +68,43 @@ The responsibilities are intentionally separate:
 Grid does not store quota state or enforce token limits. Valkey is not involved
 in provider selection. These boundaries keep quota policy and control-plane work
 outside provider routing while still allowing admitted traffic to use Grid.
+Because quota reservations are stored in Valkey, any gateway configured with the
+same backend, namespace, and policy can enforce the same logical quota. Adding or
+restarting a gateway does not create a fresh allowance for that principal.
 
 ## Topology
 
-The demo creates three Kind clusters. The west cluster hosts two separately
-addressable consumer gateway processes and the private shared Valkey service.
-Each cluster hosts one provider gateway and one VCR-backed inference workload.
+The logical topology is a pyramid. Two independently addressable edge consumer
+gateways sit above one shared quota ledger and route admitted requests into a
+three-cluster provider tier. Each provider cluster contains one provider gateway
+and one VCR-backed inference workload.
 
 ```mermaid
 flowchart TB
-    subgraph West[West cluster]
-      A[Consumer A]
-      B[Consumer B]
-      V[(Valkey)]
-      PW[Provider west]
-      VW[VCR west]
-      A <--> V
-      B <--> V
-      PW --> VW
+    C[Authenticated client]
+
+    subgraph Edge[Edge consumer tier]
+      direction LR
+      A[Consumer gateway A]
+      B[Consumer gateway B]
+    end
+
+    V[(Shared Valkey quota<br/>Alice + model)]
+
+    subgraph West[West provider cluster]
+      PW[Provider gateway west] --> VW[VCR backend west]
     end
     subgraph Central[Central cluster]
-      PC[Provider central] --> VC[VCR central]
+      PC[Provider gateway central] --> VC[VCR backend central]
     end
     subgraph East[East cluster]
-      PE[Provider east] --> VE[VCR east]
+      PE[Provider gateway east] --> VE[VCR backend east]
     end
+
+    C --> A
+    C --> B
+    A <--> V
+    B <--> V
     A --> PW
     A --> PC
     A --> PE
@@ -97,9 +114,54 @@ flowchart TB
 ```
 
 The two consumer gateways demonstrate that the quota survives process boundaries
-and consumer restarts. Their round-robin counters are intentionally local, so
-the demo claims aggregate distribution across providers, not one globally
-synchronized sequence shared by both consumers.
+and consumer restarts. The same design can extend across a horizontally scaled
+fleet of gateway replicas. Their round-robin counters are intentionally local,
+so the demo claims aggregate distribution across providers, not one globally
+synchronized sequence shared by all consumers.
+
+### Request sequences
+
+An admitted request reserves quota before provider selection. Grid has already
+published the provider set and selection mode, so Praxis selects locally from
+its in-memory overlay.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Edge as Consumer gateway
+    participant Valkey
+    participant Route as intelligent_route
+    participant Provider as Selected provider gateway
+    participant Backend as VCR backend
+
+    Client->>Edge: Authenticated inference request
+    Edge->>Valkey: Reserve estimated tokens
+    Valkey-->>Edge: Admitted + remaining capacity
+    Edge->>Route: Select from accepted Grid overlay
+    Route->>Provider: Forward with provider-hop identity
+    Provider->>Backend: Inference request
+    Backend-->>Provider: Response + token usage
+    Provider-->>Edge: Response + token usage
+    Edge->>Valkey: Settle actual usage
+    Edge-->>Client: HTTP 200 + quota and provider headers
+```
+
+When the shared window is exhausted, the request stops at quota admission. It
+does not enter routing and cannot contact a provider or backend.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Edge as Consumer gateway A or B
+    participant Valkey
+    participant Provider as Provider tier
+
+    Client->>Edge: Authenticated inference request
+    Edge->>Valkey: Reserve estimated tokens
+    Valkey-->>Edge: Shared quota exhausted
+    Edge-->>Client: HTTP 429 + limit, remaining, reset, Retry-After
+    Note over Edge,Provider: No provider selection or backend request
+```
 
 ## Prerequisites
 
@@ -125,13 +187,9 @@ Clone the exact Grid demo branch. Its Forge topology already references the
 published images listed below with `IfNotPresent` pull policy.
 
 ```bash
-git clone --branch poc/distributed-token-rate-limit-demo \
-  https://github.com/nerdalert/grid.git grid-token-rate-limit
+git clone --branch poc/distributed-token-rate-limit-demo https://github.com/nerdalert/grid.git grid-token-rate-limit
 cd grid-token-rate-limit
-
-cargo run -p forge -- \
-  --config tests/e2e/topologies/grid-token-rate-limit/forge.yaml \
-  up
+cargo run -p forge -- --config tests/e2e/topologies/grid-token-rate-limit/forge.yaml up
 ```
 
 The deployment uses:
@@ -157,10 +215,8 @@ Inspect readiness and the three-candidate overlays:
 
 ```bash
 kind get clusters
-kubectl --context kind-grid-token-rate-limit-west \
-  -n grid-system get deploy,pods
-kubectl --context kind-grid-token-rate-limit-west \
-  -n grid-system get configmap -l app.kubernetes.io/part-of=grid
+kubectl --context kind-grid-token-rate-limit-west -n grid-system get deploy,pods
+kubectl --context kind-grid-token-rate-limit-west -n grid-system get configmap -l app.kubernetes.io/part-of=grid
 ```
 
 The topology contains the consumer credentials and test quota configuration.
@@ -173,60 +229,49 @@ Use the exact source branches so the authenticated-principal, quota, routing,
 and UI contracts remain aligned:
 
 ```bash
-git clone --branch poc/authenticated-principal-metadata \
-  https://github.com/nerdalert/praxis.git praxis
-git clone --branch poc/distributed-token-rate-limit-demo \
-  https://github.com/nerdalert/ai.git ai
-git clone --branch poc/distributed-token-rate-limit-demo \
-  https://github.com/nerdalert/grid.git grid
-git clone --branch feat/distributed-token-rate-limit-demo \
-  https://github.com/nerdalert/praxis-tracing.git praxis-tracing
+git clone --branch poc/authenticated-principal-metadata https://github.com/nerdalert/praxis.git praxis
+git clone --branch poc/distributed-token-rate-limit-demo https://github.com/nerdalert/ai.git ai
+git clone --branch poc/distributed-token-rate-limit-demo https://github.com/nerdalert/grid.git grid
+git clone --branch feat/distributed-token-rate-limit-demo https://github.com/nerdalert/praxis-tracing.git praxis-tracing
 ```
 
 Build the images with the names expected by the Forge topology:
 
+<!-- markdownlint-disable MD013 -->
 ```bash
-docker build -f ai/Containerfile \
-  -t ghcr.io/nerdalert/praxis-ai:token-rate-limit-demo-20260818 ai
-docker build -f grid/deploy/operator/Containerfile \
-  -t ghcr.io/nerdalert/grid-operator:token-rate-limit-demo-20260818 grid
-docker build -f grid/overlay-sync/Containerfile \
-  -t ghcr.io/nerdalert/grid-overlay-sync:token-rate-limit-demo-20260818 grid
-docker build -f praxis-tracing/routing-observability-ui/Containerfile \
-  -t ghcr.io/nerdalert/praxis-tracing:token-rate-limit-demo-20260818 \
-  praxis-tracing/routing-observability-ui
+docker build -f ai/Containerfile -t ghcr.io/nerdalert/praxis-ai:token-rate-limit-demo-20260818 ai
+docker build -f grid/deploy/operator/Containerfile -t ghcr.io/nerdalert/grid-operator:token-rate-limit-demo-20260818 grid
+docker build -f grid/overlay-sync/Containerfile -t ghcr.io/nerdalert/grid-overlay-sync:token-rate-limit-demo-20260818 grid
+docker build -f praxis-tracing/routing-observability-ui/Containerfile -t ghcr.io/nerdalert/praxis-tracing:token-rate-limit-demo-20260818 praxis-tracing/routing-observability-ui
 ```
+<!-- markdownlint-enable MD013 -->
 
 For a completely local run, create the clusters first and load the locally built
 images before asking Forge to apply the stacks:
 
+<!-- markdownlint-disable MD013 -->
 ```bash
 CONFIG=tests/e2e/topologies/grid-token-rate-limit/forge.yaml
 for cluster in west central east; do
   cargo run -p forge -- --config "$CONFIG" cluster create "$cluster"
-  cargo run -p forge -- --config "$CONFIG" cluster load-image "$cluster" \
-    ghcr.io/nerdalert/praxis-ai:token-rate-limit-demo-20260818
-  cargo run -p forge -- --config "$CONFIG" cluster load-image "$cluster" \
-    ghcr.io/nerdalert/grid-operator:token-rate-limit-demo-20260818
-  cargo run -p forge -- --config "$CONFIG" cluster load-image "$cluster" \
-    ghcr.io/nerdalert/grid-overlay-sync:token-rate-limit-demo-20260818
-  cargo run -p forge -- --config "$CONFIG" cluster load-image "$cluster" \
-    ghcr.io/nerdalert/praxis-tracing:token-rate-limit-demo-20260818
+  cargo run -p forge -- --config "$CONFIG" cluster load-image "$cluster" ghcr.io/nerdalert/praxis-ai:token-rate-limit-demo-20260818
+  cargo run -p forge -- --config "$CONFIG" cluster load-image "$cluster" ghcr.io/nerdalert/grid-operator:token-rate-limit-demo-20260818
+  cargo run -p forge -- --config "$CONFIG" cluster load-image "$cluster" ghcr.io/nerdalert/grid-overlay-sync:token-rate-limit-demo-20260818
+  cargo run -p forge -- --config "$CONFIG" cluster load-image "$cluster" ghcr.io/nerdalert/praxis-tracing:token-rate-limit-demo-20260818
 done
 cargo run -p forge -- --config "$CONFIG" up
 ```
+<!-- markdownlint-enable MD013 -->
 
 Using the published images is the simpler cold-start path.
 
-## Exercise the behavior
+## Validate the request flow
 
 Forward the two consumer services in separate terminals:
 
 ```bash
-kubectl --context kind-grid-token-rate-limit-west -n grid-system \
-  port-forward svc/consumer-gateway-a 18080:8080
-kubectl --context kind-grid-token-rate-limit-west -n grid-system \
-  port-forward svc/consumer-gateway-b 18081:8080
+kubectl --context kind-grid-token-rate-limit-west -n grid-system port-forward svc/consumer-gateway-a 18080:8080
+kubectl --context kind-grid-token-rate-limit-west -n grid-system port-forward svc/consumer-gateway-b 18081:8080
 ```
 
 Send requests as Alice through both entries. Use the Basic Auth password from
@@ -258,10 +303,8 @@ and leaves the provider path empty for requests denied before routing.
 Open the UI and Jaeger with two additional port-forwards:
 
 ```bash
-kubectl --context kind-grid-token-rate-limit-west -n praxis-tracing \
-  port-forward svc/praxis-tracing-ui 3000:8080
-kubectl --context kind-grid-token-rate-limit-west -n praxis-tracing \
-  port-forward svc/jaeger-query 16686:16686
+kubectl --context kind-grid-token-rate-limit-west -n praxis-tracing port-forward svc/praxis-tracing-ui 3000:8080
+kubectl --context kind-grid-token-rate-limit-west -n praxis-tracing port-forward svc/jaeger-query 16686:16686
 ```
 
 Then visit `http://127.0.0.1:3000` and `http://127.0.0.1:16686`.
@@ -272,9 +315,7 @@ and Valkey, independently of whether the UI is deployed.
 ## Teardown
 
 ```bash
-cargo run -p forge -- \
-  --config tests/e2e/topologies/grid-token-rate-limit/forge.yaml \
-  down
+cargo run -p forge -- --config tests/e2e/topologies/grid-token-rate-limit/forge.yaml down
 ```
 
 Verify cleanup:
