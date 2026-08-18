@@ -37,6 +37,32 @@ https://github.com/user-attachments/assets/7d72e292-8183-4a25-aadb-995c9578efb4
 - Capacity returns incrementally as entries age out of the sliding window.
 - A Valkey outage fails closed with HTTP `503` rather than bypassing the quota.
 
+## Implementation highlights
+
+- **Authentication produces the quota identity.** Basic Auth publishes the
+  principal only after successful credential verification. The limiter consumes
+  generic identity metadata, leaving room for JWT/OIDC to provide the same
+  contract later.
+- **Quotas follow users, not gateway replicas.** The key combines the trusted
+  principal and requested model. Atomic Valkey operations give horizontally
+  scaled gateways one shared view of reservations and settled usage.
+- **Admission happens before routing.** Rejected traffic returns `429` without
+  selecting a provider, opening a provider connection, or consuming inference
+  capacity.
+- **Reservations become actual usage.** Praxis reserves an estimate before the
+  request and reconciles it with reported token usage afterward. Unused capacity
+  can be refunded, while overages are charged conservatively and settlement is
+  idempotent.
+- **Routing changes do not reset quota.** Grid can move or distribute admitted
+  traffic across provider gateways while the user/model ledger remains stable in
+  Valkey.
+- **Failure behavior is explicit.** The shared backend is bounded, reservations
+  expire, and an unavailable Valkey backend fails closed with `503` rather than
+  silently granting untracked capacity.
+- **The request path stays locally routable.** Grid computes and publishes the
+  provider overlay asynchronously. Praxis selects from its accepted in-memory
+  snapshot after quota admission instead of calling the Grid control plane.
+
 ## Architecture
 
 ```mermaid
