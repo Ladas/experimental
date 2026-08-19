@@ -21,7 +21,7 @@ selection contract.
 > development branches rather than coordinated releases.
 
 <!-- markdownlint-disable-next-line MD034 -->
-https://github.com/user-attachments/assets/7d72e292-8183-4a25-aadb-995c9578efb4
+https://github.com/user-attachments/assets/3c9a4838-7c6d-49a2-8372-8f4242531f04
 
 ## What this demonstrates
 
