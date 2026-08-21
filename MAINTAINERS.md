@@ -26,14 +26,14 @@ definitions and processes.
 
 ## AI Gateway Reviewers
 
-| Name                 | GitHub                                                           | Affiliation |
-|----------------------|------------------------------------------------------------------|-------------|
-| Alex Snaps           | [@alexsnaps](https://github.com/alexsnaps)                      | Red Hat     |
-| Aslak Knutsen        | [@aslakknutsen](https://github.com/aslakknutsen)                | Red Hat     |
-| Sebastien Han        | [@leseb](https://github.com/leseb)                              | Red Hat     |
-| Francisco Arceo      | [@franciscojavierarceo](https://github.com/franciscojavierarceo) | Red Hat     |
-| Alexander Cristurean | [@crstrn13](https://github.com/crstrn13)                        | Red Hat     |
-| Didier Di Cesare     | [@didierofrivia](https://github.com/didierofrivia)              | Red Hat     |
+| Name | GitHub | Affiliation |
+| --- | --- | --- |
+| Alex Snaps | [@alexsnaps](https://github.com/alexsnaps) | Red Hat |
+| Aslak Knutsen | [@aslakknutsen](https://github.com/aslakknutsen) | Red Hat |
+| Sebastien Han | [@leseb](https://github.com/leseb) | Red Hat |
+| Francisco Arceo | [@franciscojavierarceo](https://github.com/franciscojavierarceo) | Red Hat |
+| Alexander Cristurean | [@crstrn13](https://github.com/crstrn13) | Red Hat |
+| Didier Di Cesare | [@didierofrivia](https://github.com/didierofrivia) | Red Hat |
 
 ## Emeritus
 
