@@ -644,4 +644,4 @@ its code. The gates:
   submission, regardless of what tooling they used to produce it.
 - **Proposals**: proposal files must satisfy the
   frontmatter and lifecycle rules in
-  [proposals.md](proposals.md).
+  the [central proposal process](https://github.com/praxis-proxy/enhancements).
