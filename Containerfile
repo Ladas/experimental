@@ -79,7 +79,7 @@ FROM alpine:3.24
 
 LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/experimental" \
     org.opencontainers.image.description="Praxis experimental AI gateway (praxis-ai + experimental filters)" \
-    org.opencontainers.image.licenses="MIT"
+    org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S praxis \

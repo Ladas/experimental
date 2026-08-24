@@ -29,4 +29,4 @@ See [demos/README.md](demos/README.md) for the index of experimental demos.
 
 ## License
 
-Praxis Experimental is distributed under the MIT License. See [LICENSE](LICENSE).
+Praxis Experimental is distributed under the Apache License 2.0. See [LICENSE](LICENSE).
