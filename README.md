@@ -2,12 +2,14 @@
 
 Experimental filters, features, and builds for Praxis.
 
+Check out our [enhancements process] before using this repository.
+
 This repository is intentionally a proving ground. Features may change or be
 removed before they are promoted to a released Praxis repository.
 
-## Development
+[enhancements process]:https://github.com/praxis-proxy/enhancements
 
-Check out our [enhancements process].
+## Development
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) and [the development conventions](docs/conventions.md)
 before making changes.
@@ -20,8 +22,6 @@ The repository enforces formatting, strict Rust and Clippy lints, tests,
 documentation, dependency auditing, and supply-chain checks. See
 [docs/development.md](docs/development.md) for prerequisites and individual
 commands.
-
-[enhancements process]:https://github.com/praxis-proxy/enhancements
 
 ## Demos
 
