@@ -38,8 +38,10 @@ cargo test -p <crate> -- test_name
 
 ## Architecture
 
-Empty experimental workspace. Crates are added
-under `crates/` as experiments mature. Each crate
+The workspace holds `crates/experimental-probe`, a
+minimal probe crate that keeps the quality gates
+verifiable against real code. Additional crates are
+added under `crates/` as experiments mature. Each crate
 inherits workspace lints, dependencies, and
 profiles from the root `Cargo.toml`.
 
