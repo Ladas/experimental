@@ -12,6 +12,8 @@ RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf cmake ma
 
 WORKDIR /src
 
+ARG FEATURES=""
+
 # ------------------------------------------------------------------------------
 # Cache Build
 # ------------------------------------------------------------------------------
@@ -45,7 +47,7 @@ RUN mkdir -p crates/experimental-probe/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-experimental-server
+    cargo build --release -p praxis-experimental-server ${FEATURES:+--features "$FEATURES"}
 
 # ------------------------------------------------------------------------------
 # Cache Tricks
@@ -68,7 +70,7 @@ RUN find crates -name '*.rs' -exec touch {} +
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-experimental-server \
+    cargo build --release -p praxis-experimental-server ${FEATURES:+--features "$FEATURES"} \
     && cp target/release/praxis-experimental-server /usr/local/bin/praxis-experimental-server
 
 # ------------------------------------------------------------------------------
@@ -77,9 +79,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM alpine:3.24
 
+# Re-declare in this stage: ARG scope does not cross FROM boundaries.
+ARG FEATURES=""
+
+# io.praxis.build.features records which non-default cargo features the binary
+# was compiled with, so a pulled image can be interrogated for its capabilities:
+#   docker inspect --format \
+#     '{{index .Config.Labels "io.praxis.build.features"}}' <image>
 LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/experimental" \
     org.opencontainers.image.description="Praxis experimental AI gateway (praxis-ai + experimental filters)" \
-    org.opencontainers.image.licenses="Apache-2.0"
+    org.opencontainers.image.licenses="Apache-2.0" \
+    io.praxis.build.features="${FEATURES}"
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S praxis \
