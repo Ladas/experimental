@@ -703,12 +703,261 @@ impl RouteError {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test-module suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::assertions_on_result_states,
+    clippy::arithmetic_side_effects,
+    clippy::let_underscore_must_use,
+    clippy::min_ident_chars,
+    clippy::float_cmp,
+    clippy::too_many_lines,
+    reason = "unwrap/expect/panic and terse helpers are acceptable in tests"
+)]
 mod tests {
-    use praxis_filter::FilterRegistry;
+    use std::{
+        net::SocketAddr,
+        sync::{
+            LazyLock,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
-    use super::RouteError;
+    use praxis_core::subrequest::SubRequestConnector;
+    use praxis_filter::{FilterRegistry, Request};
+
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Fixtures
+    // -----------------------------------------------------------------------
+
+    /// Deterministic ID generator for the test filter context.
+    static TEST_IDS: LazyLock<praxis_core::id::IdGenerator> =
+        LazyLock::new(|| praxis_core::id::IdGenerator::with_seed(0));
+
+    /// Wall-clock source for the test filter context.
+    static TEST_TIME: praxis_core::time::SystemTimeSource = praxis_core::time::SystemTimeSource;
+
+    /// Builds a POST request for `path`.
+    fn make_request(path: &str) -> Request {
+        Request {
+            method: http::Method::POST,
+            uri: path.parse().expect("test path is a valid URI"),
+            headers: http::HeaderMap::new(),
+        }
+    }
+
+    /// Builds a POST request carrying an explicit Switchyard session id.
+    fn make_request_with_session(path: &str, session: &str) -> Request {
+        let mut request = make_request(path);
+        request.headers.insert(
+            http::HeaderName::from_static(session::SESSION_ID_HEADER),
+            http::HeaderValue::from_str(session).expect("test session id is a valid header value"),
+        );
+        request
+    }
+
+    /// Builds a filter context, mirroring every field of `HttpFilterContext`.
+    fn make_ctx<'ctx>(request: &'ctx Request, client: Option<&'ctx SubRequestClient>) -> HttpFilterContext<'ctx> {
+        HttpFilterContext {
+            buffered_request_body: None,
+            body_done_indices: Vec::new(),
+            branch_iterations: std::collections::HashMap::new(),
+            client_addr: None,
+            cluster: None,
+            current_filter_id: None,
+            downstream_tls: false,
+            metrics_route: None,
+            peer_identity: None,
+            extensions: praxis_filter::RequestExtensions::default(),
+            executed_filter_indices: Vec::new(),
+            extra_request_headers: Vec::new(),
+            request_headers_to_remove: Vec::new(),
+            request_headers_to_set: Vec::new(),
+            filter_metadata: std::collections::HashMap::new(),
+            pre_read_mutations: Vec::new(),
+            structured_metadata: std::collections::HashMap::new(),
+            filter_results: std::collections::HashMap::new(),
+            filter_state: std::collections::HashMap::new(),
+            health_registry: None,
+            id_generator: &TEST_IDS,
+            kv_stores: None,
+            session_stores: None,
+            subrequest_client: client,
+            subrequest_response_mode: praxis_filter::SubRequestResponseMode::Buffered,
+            request,
+            request_body_bytes: 0,
+            request_body_mode: BodyMode::Stream,
+            request_start: Instant::now(),
+            response_body_bytes: 0,
+            response_body_mode: BodyMode::Stream,
+            response_header: None,
+            response_headers_modified: false,
+            selected_endpoint_index: None,
+            attempted_endpoints: Vec::new(),
+            retry_policy: None,
+            route_retry_policy: None,
+            cluster_retry_state: None,
+            cluster_retry_state_released: false,
+            endpoint_reselector: None,
+            pinned_endpoint_address: None,
+            time_source: &TEST_TIME,
+            rewritten_path: None,
+            upstream: None,
+        }
+    }
+
+    /// Builds filter YAML pointing at `endpoint` with the given failure mode.
+    fn config_yaml(endpoint: &str, on_failure: &str) -> serde_yaml::Value {
+        let yaml = format!(
+            concat!(
+                "judge:\n",
+                "  endpoint: \"{}\"\n",
+                "  model: \"judge-model\"\n",
+                "  timeout_ms: 4000\n",
+                "targets:\n",
+                "  weak:\n",
+                "    cluster: \"weak-cluster\"\n",
+                "    model: \"weak-model\"\n",
+                "  strong:\n",
+                "    cluster: \"strong-cluster\"\n",
+                "    model: \"strong-model\"\n",
+                "threshold: 0.5\n",
+                "on_failure: {}\n",
+            ),
+            endpoint, on_failure
+        );
+        serde_yaml::from_str(&yaml).expect("test config YAML parses")
+    }
+
+    /// Builds a filter whose judge lives at `endpoint`.
+    fn make_filter(endpoint: &str, on_failure: &str) -> Box<dyn HttpFilter> {
+        SwitchyardRouteFilter::from_config(&config_yaml(endpoint, on_failure)).expect("test filter config is valid")
+    }
+
+    /// A minimal `OpenAI` chat request body.
+    fn chat_body(prompt: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "model": "client-model",
+                "messages": [{"role": "user", "content": prompt}],
+            })
+            .to_string(),
+        )
+    }
+
+    /// The judge verdict payload, mirroring `demos/switchyard-route/upstreams.py`.
+    fn verdict(p_solve: f64, rule: &str, boundary: &str) -> String {
+        serde_json::json!({
+            "crux": "test prompt",
+            "primary_rule": rule,
+            "capability_boundary": boundary,
+            "p_solve": p_solve,
+        })
+        .to_string()
+    }
+
+    /// Wraps `content` in an `OpenAI` chat completion response.
+    fn judge_body(content: &str) -> String {
+        serde_json::json!({
+            "id": "chat-test",
+            "object": "chat.completion",
+            "model": "judge-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }],
+        })
+        .to_string()
+    }
+
+    /// True once the buffer holds a complete request (headers plus declared body).
+    fn request_is_complete(raw: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(raw);
+        let Some(header_end) = text.find("\r\n\r\n") else {
+            return false;
+        };
+        let declared = text
+            .lines()
+            .find_map(|line| {
+                let lowered = line.to_ascii_lowercase();
+                lowered
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        raw.len() >= header_end + 4 + declared
+    }
+
+    /// Serves one canned HTTP response per request on an ephemeral port.
+    async fn spawn_judge(status_line: &'static str, body: String) -> SocketAddr {
+        spawn_judge_sequence(vec![(status_line, body)]).await
+    }
+
+    /// Serves `responses` in order, one per request, repeating the last one.
+    ///
+    /// Requests are counted rather than connections so that a pooled keep-alive
+    /// connection cannot desynchronise the sequence.
+    async fn spawn_judge_sequence(responses: Vec<(&'static str, String)>) -> SocketAddr {
+        assert!(!responses.is_empty(), "the mock judge needs at least one response");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock judge binds an ephemeral port");
+        let addr = listener.local_addr().expect("mock judge reports its address");
+        let responses = Arc::new(responses);
+        let served = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let responses = Arc::clone(&responses);
+                let served = Arc::clone(&served);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    loop {
+                        let mut raw = Vec::new();
+                        let mut chunk = [0_u8; 4096];
+                        let complete = loop {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break false,
+                                Ok(read) => raw.extend_from_slice(&chunk[..read]),
+                            }
+                            if request_is_complete(&raw) {
+                                break true;
+                            }
+                        };
+                        if !complete {
+                            break;
+                        }
+                        let index = served.fetch_add(1, Ordering::SeqCst).min(responses.len() - 1);
+                        let (status_line, body) = &responses[index];
+                        let response = format!(
+                            "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        drop(stream.flush().await);
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// A subrequest client suitable for judge callouts in tests.
+    fn make_client() -> SubRequestClient {
+        SubRequestClient::new(SubRequestConnector::new(2, None))
+    }
+
+    // -----------------------------------------------------------------------
+    // Registration and filter metadata
+    // -----------------------------------------------------------------------
 
     #[test]
     fn filter_is_registered() {
@@ -720,6 +969,763 @@ mod tests {
             "expected switchyard_route in {names:?}"
         );
     }
+
+    #[test]
+    fn advertises_body_buffering_and_cluster_selection() {
+        let filter = make_filter("http://127.0.0.1:1/v1/chat/completions", "open");
+        assert_eq!(
+            filter.name(),
+            "switchyard_route",
+            "advertised name must match registration"
+        );
+        assert!(
+            matches!(filter.request_body_access(), BodyAccess::ReadWrite),
+            "the filter rewrites the request body, so it needs read-write access"
+        );
+        assert!(
+            matches!(
+                filter.request_body_mode(),
+                BodyMode::StreamBuffer {
+                    max_bytes: Some(DEFAULT_MAX_BODY_BYTES)
+                }
+            ),
+            "the routing decision needs the whole body buffered"
+        );
+        assert!(
+            filter.selects_cluster(),
+            "the filter picks the upstream cluster, so it must declare that"
+        );
+        assert_eq!(
+            filter.selected_clusters(),
+            vec!["weak-cluster".to_owned(), "strong-cluster".to_owned()],
+            "both tiers must be declared so pipeline validation can see them"
+        );
+    }
+
+    #[test]
+    fn debug_omits_the_algorithm() {
+        let config =
+            config::parse(&config_yaml("http://127.0.0.1:1/v1/chat/completions", "open")).expect("config is valid");
+        let algorithm = build_algorithm(&config).expect("the classifier builds from a valid config");
+        let filter = SwitchyardRouteFilter {
+            config,
+            algorithm,
+            sessions: Mutex::new(session::SessionStore::with_defaults()),
+        };
+        let rendered = format!("{filter:?}");
+        assert!(
+            rendered.contains("SwitchyardRouteFilter") && rendered.contains("weak-cluster"),
+            "Debug must name the type and show config, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("Algorithm"),
+            "the classifier is not Debug and must stay out, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_invalid_yaml() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("judge: {}").expect("YAML parses");
+        assert!(
+            SwitchyardRouteFilter::from_config(&yaml).is_err(),
+            "a config without targets must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // JudgeEndpoint::parse
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_http_endpoint_with_default_port() {
+        let endpoint = JudgeEndpoint::parse("http://judge.internal/v1/chat/completions").expect("URL parses");
+        assert!(!endpoint.tls, "http:// must not enable TLS");
+        assert_eq!(endpoint.host, "judge.internal", "host comes from the authority");
+        assert_eq!(endpoint.port, 80, "http:// defaults to port 80");
+        assert_eq!(endpoint.sni, "", "cleartext endpoints carry no SNI");
+        assert_eq!(
+            endpoint.uri.to_string(),
+            "/v1/chat/completions",
+            "the POST target is the path and query only"
+        );
+    }
+
+    #[test]
+    fn parses_https_endpoint_with_default_port_and_sni() {
+        let endpoint = JudgeEndpoint::parse("https://judge.example.com/v1/chat/completions").expect("URL parses");
+        assert!(endpoint.tls, "https:// must enable TLS");
+        assert_eq!(endpoint.port, 443, "https:// defaults to port 443");
+        assert_eq!(endpoint.sni, "judge.example.com", "TLS endpoints use the host as SNI");
+        assert_eq!(
+            endpoint.authority.to_str().expect("authority is ASCII"),
+            "judge.example.com",
+            "the Host header carries the original authority"
+        );
+    }
+
+    #[test]
+    fn parses_explicit_port_and_preserves_query() {
+        let endpoint = JudgeEndpoint::parse("https://judge:9443/v1/chat?api-version=2024-02-01").expect("URL parses");
+        assert_eq!(endpoint.port, 9443, "an explicit port overrides the scheme default");
+        assert_eq!(
+            endpoint.uri.to_string(),
+            "/v1/chat?api-version=2024-02-01",
+            "the query string must survive into the sub-request"
+        );
+    }
+
+    #[test]
+    fn parses_ipv6_host_without_brackets() {
+        let endpoint = JudgeEndpoint::parse("http://[::1]:8000/v1/chat/completions").expect("URL parses");
+        assert_eq!(endpoint.host, "::1", "DNS lookup needs the bare IPv6 literal");
+        assert_eq!(endpoint.port, 8000, "the explicit port is used");
+        assert_eq!(
+            endpoint.authority.to_str().expect("authority is ASCII"),
+            "[::1]:8000",
+            "the Host header keeps the bracketed form"
+        );
+    }
+
+    #[test]
+    fn parses_endpoint_without_path_as_root() {
+        let endpoint = JudgeEndpoint::parse("http://judge.internal").expect("URL parses");
+        assert_eq!(endpoint.uri.to_string(), "/", "a missing path becomes /");
+    }
+
+    #[test]
+    fn rejects_unsupported_scheme() {
+        let Err(err) = JudgeEndpoint::parse("ftp://judge.internal/v1") else {
+            panic!("ftp is not a supported judge scheme");
+        };
+        assert!(
+            err.to_string().contains("unsupported scheme 'ftp'"),
+            "the error must name the scheme, got {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_relative_endpoint() {
+        let Err(err) = JudgeEndpoint::parse("/v1/chat/completions") else {
+            panic!("a bare path is not an absolute endpoint");
+        };
+        assert!(
+            err.to_string().contains("absolute http(s) URL"),
+            "the error must ask for an absolute URL, got {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unparsable_endpoint() {
+        let Err(err) = JudgeEndpoint::parse("http://ju dge/v1") else {
+            panic!("a space is not valid in an authority");
+        };
+        assert!(
+            err.to_string().contains("bad endpoint"),
+            "URI parse failures are reported as bad endpoints, got {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // JudgeEndpoint::build_request
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn builds_unauthenticated_judge_post() {
+        let endpoint = JudgeEndpoint::parse("http://judge.internal:8000/v1/chat/completions").expect("URL parses");
+        let subrequest = endpoint
+            .build_request(Bytes::from_static(b"{}"), None)
+            .expect("request builds");
+        assert_eq!(subrequest.method, http::Method::POST, "judge calls are POSTs");
+        assert_eq!(
+            subrequest.uri.to_string(),
+            "/v1/chat/completions",
+            "the sub-request targets the judge path"
+        );
+        assert_eq!(
+            subrequest
+                .headers
+                .get(http::header::HOST)
+                .map(|value| value.to_str().expect("ASCII")),
+            Some("judge.internal:8000"),
+            "the Host header carries the judge authority"
+        );
+        assert_eq!(
+            subrequest
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .map(|value| value.to_str().expect("ASCII")),
+            Some("application/json"),
+            "the judge speaks JSON"
+        );
+        assert!(
+            !subrequest.headers.contains_key(http::header::AUTHORIZATION),
+            "no token configured means no Authorization header"
+        );
+        assert_eq!(
+            subrequest.body,
+            Bytes::from_static(b"{}"),
+            "the encoded body is passed through"
+        );
+    }
+
+    #[test]
+    fn builds_authenticated_judge_post() {
+        let endpoint = JudgeEndpoint::parse("https://judge.example.com/v1/chat/completions").expect("URL parses");
+        let subrequest = endpoint
+            .build_request(Bytes::from_static(b"{}"), Some("sk-test"))
+            .expect("request builds");
+        assert_eq!(
+            subrequest
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .map(|value| value.to_str().expect("ASCII")),
+            Some("Bearer sk-test"),
+            "the configured token becomes a bearer credential"
+        );
+    }
+
+    #[test]
+    fn rejects_token_that_cannot_be_a_header() {
+        let endpoint = JudgeEndpoint::parse("https://judge.example.com/v1").expect("URL parses");
+        let err = endpoint
+            .build_request(Bytes::new(), Some("bad\nvalue"))
+            .expect_err("a newline cannot go in a header");
+        assert!(
+            err.to_string().contains("invalid auth header"),
+            "the error must point at the auth header, got {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Peer construction and DNS
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn builds_cleartext_peer_without_tls_options() {
+        let endpoint = JudgeEndpoint::parse("http://judge.internal:8000/v1").expect("URL parses");
+        let addr: SocketAddr = "127.0.0.1:8000".parse().expect("socket address parses");
+        let peer = build_judge_peer(addr, &endpoint, true);
+        assert!(!peer.is_tls(), "an http:// judge must be dialled in cleartext");
+    }
+
+    #[test]
+    fn builds_verifying_tls_peer_by_default() {
+        let endpoint = JudgeEndpoint::parse("https://judge.example.com/v1").expect("URL parses");
+        let addr: SocketAddr = "127.0.0.1:8443".parse().expect("socket address parses");
+        let peer = build_judge_peer(addr, &endpoint, true);
+        assert!(peer.is_tls(), "an https:// judge must be dialled over TLS");
+        assert!(
+            peer.options.verify_cert,
+            "verify_tls: true must keep certificate checks on"
+        );
+        assert!(
+            peer.options.verify_hostname,
+            "verify_tls: true must keep hostname checks on"
+        );
+    }
+
+    #[test]
+    fn disables_tls_verification_when_configured() {
+        let endpoint = JudgeEndpoint::parse("https://judge.example.com/v1").expect("URL parses");
+        let addr: SocketAddr = "127.0.0.1:8443".parse().expect("socket address parses");
+        let peer = build_judge_peer(addr, &endpoint, false);
+        assert!(
+            !peer.options.verify_cert,
+            "verify_tls: false must skip certificate checks"
+        );
+        assert!(
+            !peer.options.verify_hostname,
+            "verify_tls: false must skip hostname checks"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_loopback_judge_addresses() {
+        let addrs = resolve_judge_addrs("127.0.0.1", 8000).await.expect("loopback resolves");
+        assert_eq!(
+            addrs,
+            vec!["127.0.0.1:8000".parse::<SocketAddr>().expect("socket address parses")],
+            "a literal address resolves to itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_dns_failures() {
+        let err = resolve_judge_addrs("judge.invalid.", 8000)
+            .await
+            .expect_err("the reserved .invalid TLD never resolves");
+        assert!(
+            err.to_string().contains("DNS resolution failed for judge.invalid."),
+            "the error must name the host, got {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Body helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rejects_a_missing_body() {
+        let err = parse_body(None).expect_err("no body means no routing decision");
+        assert_eq!(
+            err.to_string(),
+            "request body missing",
+            "a missing body is reported as such"
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_body() {
+        let empty = Bytes::new();
+        let err = parse_body(Some(&empty)).expect_err("an empty body means no routing decision");
+        assert_eq!(
+            err.to_string(),
+            "request body empty",
+            "an empty body is reported as such"
+        );
+    }
+
+    #[test]
+    fn rejects_non_json_body() {
+        let raw = Bytes::from_static(b"not json");
+        let err = parse_body(Some(&raw)).expect_err("the body must be JSON");
+        assert!(
+            err.to_string().starts_with("invalid JSON:"),
+            "the parse error must be surfaced, got {err}"
+        );
+    }
+
+    #[test]
+    fn parses_json_body() {
+        let raw = chat_body("hello");
+        let value = parse_body(Some(&raw)).expect("a chat body is JSON");
+        assert_eq!(
+            value["model"], "client-model",
+            "the parsed value keeps the client's fields"
+        );
+    }
+
+    #[test]
+    fn rewrites_the_model_field() {
+        let value = serde_json::json!({"model": "client-model", "messages": []});
+        let rewritten = rewrite_model(value, "weak-model").expect("an object can be rewritten");
+        let parsed: serde_json::Value = serde_json::from_slice(&rewritten).expect("output is JSON");
+        assert_eq!(parsed["model"], "weak-model", "the tier's model replaces the client's");
+        assert!(
+            parsed.get("messages").is_some(),
+            "other fields must survive the rewrite"
+        );
+    }
+
+    #[test]
+    fn rejects_rewriting_a_non_object_body() {
+        let err =
+            rewrite_model(serde_json::json!([1, 2, 3]), "weak-model").expect_err("a JSON array has no model field");
+        assert_eq!(
+            err.to_string(),
+            "request body not an object",
+            "the error must say the body is not an object"
+        );
+    }
+
+    #[test]
+    fn previews_truncate_long_bodies() {
+        let body = Bytes::from("x".repeat(500));
+        let preview = body_preview(&body);
+        assert_eq!(preview.chars().count(), 200, "previews are capped at 200 characters");
+    }
+
+    #[test]
+    fn previews_survive_invalid_utf8() {
+        let body = Bytes::from_static(&[0xFF, 0xFE, b'o', b'k']);
+        let preview = body_preview(&body);
+        assert!(
+            preview.ends_with("ok"),
+            "lossy decoding must keep the readable tail, got {preview}"
+        );
+    }
+
+    #[test]
+    fn decodes_a_chat_body_for_the_judge() {
+        let value = serde_json::json!({
+            "model": "client-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        let decoded = decode_for_judge(&value).expect("a chat body decodes into Switchyard IR");
+        assert_eq!(
+            decoded.model.as_deref(),
+            Some("client-model"),
+            "the client's model survives into the IR"
+        );
+    }
+
+    #[test]
+    fn rejects_a_body_the_translator_cannot_decode() {
+        let err =
+            decode_for_judge(&serde_json::json!("not an object")).expect_err("a bare string is not a chat request");
+        assert!(
+            err.to_string().starts_with("translation failed:"),
+            "translation errors must be surfaced, got {err}"
+        );
+    }
+
+    #[test]
+    fn logging_a_verdict_tolerates_malformed_payloads() {
+        // Each of these hits a different early return; none may panic.
+        log_judge_verdict(b"not json");
+        log_judge_verdict(br#"{"choices": []}"#);
+        log_judge_verdict(&serde_json::to_vec(&judge_body("not json")).expect("serializes"));
+        log_judge_verdict(judge_body(&verdict(0.95, "SUP-1", "supported")).as_bytes());
+        log_judge_verdict(judge_body("{}").as_bytes());
+    }
+
+    // -----------------------------------------------------------------------
+    // Judge response decoding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decodes_an_aggregated_judge_response() {
+        let addr: SocketAddr = "127.0.0.1:8000".parse().expect("socket address parses");
+        let body = Bytes::from(judge_body(&verdict(0.95, "SUP-1", "supported")));
+        assert!(
+            decode_judge_aggregated(addr, &body).is_ok(),
+            "a well-formed chat completion must decode"
+        );
+    }
+
+    #[test]
+    fn retries_when_the_judge_returns_non_json() {
+        let addr: SocketAddr = "127.0.0.1:8000".parse().expect("socket address parses");
+        let body = Bytes::from_static(b"<html>gateway error</html>");
+        match decode_judge_aggregated(addr, &body) {
+            Err(JudgeAttemptError::Retryable(message)) => {
+                assert!(
+                    message.contains("judge_non_json from 127.0.0.1:8000"),
+                    "the message must name the address, got {message}"
+                );
+                assert!(
+                    message.contains("<html>"),
+                    "the message must preview the body, got {message}"
+                );
+            },
+            Err(JudgeAttemptError::Fatal(err)) => panic!("a non-JSON body is retryable, got fatal {err}"),
+            Ok(_) => panic!("HTML is not a judge response"),
+        }
+    }
+
+    #[test]
+    fn fails_fatally_when_translation_rejects_the_judge_response() {
+        let addr: SocketAddr = "127.0.0.1:8000".parse().expect("socket address parses");
+        let body = Bytes::from_static(b"[1, 2, 3]");
+        match decode_judge_aggregated(addr, &body) {
+            Err(JudgeAttemptError::Fatal(err)) => assert!(
+                err.to_string().contains("response translation failed"),
+                "the error must name the translation step, got {err}"
+            ),
+            Err(JudgeAttemptError::Retryable(message)) => {
+                panic!("valid JSON that is not a completion is fatal, got retryable {message}")
+            },
+            Ok(_) => panic!("a JSON array is not a judge response"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Error rendering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn route_errors_render_their_cause() {
+        let cases = [
+            (RouteError::Body("missing"), "request body missing"),
+            (
+                RouteError::Json("expected value".to_owned()),
+                "invalid JSON: expected value",
+            ),
+            (RouteError::UnsupportedPath, "unsupported path (only /chat/completions)"),
+            (
+                RouteError::Translation("no messages".to_owned()),
+                "translation failed: no messages",
+            ),
+            (RouteError::Serialize("io".to_owned()), "serialize failed: io"),
+            (RouteError::MissingSubrequestClient, "subrequest client unavailable"),
+            (RouteError::Judge("timeout".to_owned()), "judge callout failed: timeout"),
+            (RouteError::Run("stream".to_owned()), "switchyard run failed: stream"),
+            (RouteError::NoDecision, "no routing decision"),
+            (RouteError::UnknownTier("medium".to_owned()), "unknown tier 'medium'"),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected, "RouteError must render its cause");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Filter hooks
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ignores_body_chunks_before_end_of_stream() {
+        let filter = make_filter("http://127.0.0.1:1/v1/chat/completions", "closed");
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, None);
+        let mut body = Some(chat_body("hello"));
+
+        let action = filter
+            .on_request_body(&mut ctx, &mut body, false)
+            .await
+            .expect("partial chunks are never an error");
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "a partial chunk must pass through untouched"
+        );
+        assert!(
+            ctx.get_metadata(METADATA_CLUSTER).is_none(),
+            "no decision may be taken before the body is complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn fails_open_when_routing_fails() {
+        // No subrequest client in the context, so the judge can never be called.
+        let filter = make_filter("http://127.0.0.1:1/v1/chat/completions", "open");
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, None);
+        let mut body = Some(chat_body("hello"));
+
+        let action = filter
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .expect("fail-open never returns an error");
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "on_failure: open must let the request through"
+        );
+        assert_eq!(
+            ctx.get_metadata("switchyard_route.error"),
+            Some("subrequest client unavailable"),
+            "the failure reason must be recorded for access logs"
+        );
+    }
+
+    #[tokio::test]
+    async fn fails_closed_when_routing_fails() {
+        let filter = make_filter("http://127.0.0.1:1/v1/chat/completions", "closed");
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, None);
+        let mut body = Some(chat_body("hello"));
+
+        let action = filter
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .expect("fail-closed rejects rather than erroring");
+
+        let FilterAction::Reject(rejection) = action else {
+            panic!("on_failure: closed must reject the request");
+        };
+        assert_eq!(
+            rejection.status, 503,
+            "a failed routing decision must surface as 503 Service Unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_non_chat_completion_paths() {
+        let filter = make_filter("http://127.0.0.1:1/v1/chat/completions", "closed");
+        let request = make_request("/v1/embeddings");
+        let mut ctx = make_ctx(&request, None);
+        let mut body = Some(chat_body("hello"));
+
+        let action = filter
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .expect("an unsupported path is a routing failure, not an error");
+
+        assert!(
+            matches!(action, FilterAction::Reject(_)),
+            "only /chat/completions can be routed"
+        );
+        assert_eq!(
+            ctx.get_metadata("switchyard_route.error"),
+            Some("unsupported path (only /chat/completions)"),
+            "the recorded reason must name the path problem"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_request_promotes_the_stashed_cluster() {
+        let filter = make_filter("http://127.0.0.1:1/v1/chat/completions", "open");
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, None);
+        ctx.set_metadata(METADATA_CLUSTER, "strong-cluster");
+
+        let action = filter.on_request(&mut ctx).await.expect("on_request never fails");
+
+        assert!(matches!(action, FilterAction::Continue), "on_request always continues");
+        assert_eq!(
+            ctx.cluster_name(),
+            Some("strong-cluster"),
+            "the body-phase decision must select the cluster"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_request_leaves_the_cluster_alone_without_a_decision() {
+        let filter = make_filter("http://127.0.0.1:1/v1/chat/completions", "open");
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, None);
+
+        drop(filter.on_request(&mut ctx).await.expect("on_request never fails"));
+
+        assert!(
+            ctx.cluster_name().is_none(),
+            "without a decision the router's own cluster choice must stand"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end routing against a mock judge
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routes_to_the_weak_tier_when_the_judge_reports_supported() {
+        let addr = spawn_judge("HTTP/1.1 200 OK", judge_body(&verdict(0.95, "SUP-1", "supported"))).await;
+        let filter = make_filter(&format!("http://{addr}/v1/chat/completions"), "closed");
+        let client = make_client();
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, Some(&client));
+        let mut body = Some(chat_body("what is 2 + 2?"));
+
+        let action = filter
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .expect("routing succeeds");
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "a successful decision lets the request continue"
+        );
+        assert_eq!(
+            ctx.get_metadata(METADATA_CLUSTER),
+            Some("weak-cluster"),
+            "a supported prompt must route to the weak tier"
+        );
+        assert_eq!(
+            ctx.get_metadata(METADATA_DECISION),
+            Some("routed"),
+            "a live judge verdict must be recorded as a real route, not a fallback"
+        );
+        let routed: serde_json::Value =
+            serde_json::from_slice(&body.expect("the body is rewritten in place")).expect("the body is JSON");
+        assert_eq!(
+            routed["model"], "weak-model",
+            "the upstream must be asked for the weak tier's model"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routes_to_the_strong_tier_when_the_judge_reports_unsupported() {
+        let addr = spawn_judge("HTTP/1.1 200 OK", judge_body(&verdict(0.0, "LIM-2", "unsupported"))).await;
+        let filter = make_filter(&format!("http://{addr}/v1/chat/completions"), "closed");
+        let client = make_client();
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, Some(&client));
+        let mut body = Some(chat_body("reverse-engineer this undocumented format"));
+
+        drop(
+            filter
+                .on_request_body(&mut ctx, &mut body, true)
+                .await
+                .expect("routing succeeds"),
+        );
+
+        assert_eq!(
+            ctx.get_metadata(METADATA_CLUSTER),
+            Some("strong-cluster"),
+            "an unsupported prompt must route to the strong tier"
+        );
+        let routed: serde_json::Value =
+            serde_json::from_slice(&body.expect("the body is rewritten in place")).expect("the body is JSON");
+        assert_eq!(
+            routed["model"], "strong-model",
+            "the upstream must be asked for the strong tier's model"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn judge_http_errors_are_reported_as_callout_failures() {
+        let addr = spawn_judge("HTTP/1.1 500 Internal Server Error", "upstream exploded".to_owned()).await;
+        let filter = make_filter(&format!("http://{addr}/v1/chat/completions"), "open");
+        let client = make_client();
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, Some(&client));
+        let mut body = Some(chat_body("hello"));
+
+        let action = filter
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .expect("fail-open never returns an error");
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "on_failure: open must let the request through"
+        );
+        let recorded = ctx
+            .get_metadata("switchyard_route.error")
+            .expect("the failure reason is recorded");
+        assert!(
+            recorded.contains("HTTP 500"),
+            "the recorded reason must name the judge status, got {recorded}"
+        );
+        assert_eq!(
+            ctx.get_metadata(METADATA_DECISION),
+            Some("default_strong"),
+            "with nothing remembered, a judge outage must fall back to the strong tier"
+        );
+        assert_eq!(
+            ctx.get_metadata(METADATA_CLUSTER),
+            Some("strong-cluster"),
+            "the fallback must select the strong cluster"
+        );
+        let routed: serde_json::Value =
+            serde_json::from_slice(&body.expect("the body is rewritten in place")).expect("the body is JSON");
+        assert_eq!(
+            routed["model"], "strong-model",
+            "the fallback must rewrite the model, not just the cluster"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreachable_judges_are_reported_as_callout_failures() {
+        // Bind and immediately drop, so the port is almost certainly closed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds an ephemeral port");
+        let addr = listener.local_addr().expect("reports its address");
+        drop(listener);
+
+        let filter = make_filter(&format!("http://{addr}/v1/chat/completions"), "open");
+        let client = make_client();
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, Some(&client));
+        let mut body = Some(chat_body("hello"));
+
+        drop(
+            filter
+                .on_request_body(&mut ctx, &mut body, true)
+                .await
+                .expect("fail-open never returns an error"),
+        );
+
+        let recorded = ctx
+            .get_metadata("switchyard_route.error")
+            .expect("the failure reason is recorded");
+        assert!(
+            recorded.starts_with("judge callout failed:"),
+            "a refused connection must surface as a judge callout failure, got {recorded}"
+        );
+    }
+
 
     #[test]
     fn judge_failures_may_apply_a_fallback_tier() {
@@ -750,6 +1756,197 @@ mod tests {
         assert!(
             !RouteError::Body("empty").may_apply_failure_tier(),
             "missing bodies cannot be rewritten"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Failure policy: reuse, default Strong, unrouted
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reuses_the_remembered_tier_when_the_judge_goes_down() {
+        // Turn one: the judge answers, the weak tier is remembered for the session.
+        // Turn two: the judge is down, so that remembered tier is served instead.
+        let addr = spawn_judge_sequence(vec![
+            ("HTTP/1.1 200 OK", judge_body(&verdict(0.95, "SUP-1", "supported"))),
+            ("HTTP/1.1 500 Internal Server Error", "judge down".to_owned()),
+        ])
+        .await;
+        let filter = make_filter(&format!("http://{addr}/v1/chat/completions"), "open");
+        let client = make_client();
+        let request = make_request_with_session("/v1/chat/completions", "session-alpha");
+
+        let mut first_ctx = make_ctx(&request, Some(&client));
+        let mut first_body = Some(chat_body("what is 2 + 2?"));
+        drop(
+            filter
+                .on_request_body(&mut first_ctx, &mut first_body, true)
+                .await
+                .expect("the first turn routes normally"),
+        );
+        assert_eq!(
+            first_ctx.get_metadata(METADATA_DECISION),
+            Some("routed"),
+            "the first turn must be a live judge decision"
+        );
+        assert_eq!(
+            first_ctx.get_metadata(METADATA_CLUSTER),
+            Some("weak-cluster"),
+            "the first turn must route weak so there is a weak verdict to reuse"
+        );
+
+        let mut second_ctx = make_ctx(&request, Some(&client));
+        let mut second_body = Some(chat_body("what is 3 + 3?"));
+        let action = filter
+            .on_request_body(&mut second_ctx, &mut second_body, true)
+            .await
+            .expect("fail-open never returns an error");
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "a reused tier must let the request through"
+        );
+        assert_eq!(
+            second_ctx.get_metadata(METADATA_DECISION),
+            Some("reuse"),
+            "a judge outage on a known session must reuse the last success, not default to strong"
+        );
+        assert_eq!(
+            second_ctx.get_metadata(METADATA_CLUSTER),
+            Some("weak-cluster"),
+            "the reused tier must select the same cluster the judge chose"
+        );
+        let routed: serde_json::Value =
+            serde_json::from_slice(&second_body.expect("the body is rewritten in place")).expect("the body is JSON");
+        assert_eq!(
+            routed["model"], "weak-model",
+            "reuse must rewrite the model to the remembered tier's target"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn does_not_reuse_across_different_sessions() {
+        let addr = spawn_judge_sequence(vec![
+            ("HTTP/1.1 200 OK", judge_body(&verdict(0.95, "SUP-1", "supported"))),
+            ("HTTP/1.1 500 Internal Server Error", "judge down".to_owned()),
+        ])
+        .await;
+        let filter = make_filter(&format!("http://{addr}/v1/chat/completions"), "open");
+        let client = make_client();
+
+        let known = make_request_with_session("/v1/chat/completions", "session-alpha");
+        let mut first_ctx = make_ctx(&known, Some(&client));
+        let mut first_body = Some(chat_body("what is 2 + 2?"));
+        drop(
+            filter
+                .on_request_body(&mut first_ctx, &mut first_body, true)
+                .await
+                .expect("the first turn routes normally"),
+        );
+
+        let stranger = make_request_with_session("/v1/chat/completions", "session-beta");
+        let mut second_ctx = make_ctx(&stranger, Some(&client));
+        let mut second_body = Some(chat_body("something else entirely"));
+        drop(
+            filter
+                .on_request_body(&mut second_ctx, &mut second_body, true)
+                .await
+                .expect("fail-open never returns an error"),
+        );
+
+        assert_eq!(
+            second_ctx.get_metadata(METADATA_DECISION),
+            Some("default_strong"),
+            "one session's remembered tier must not leak into another"
+        );
+    }
+
+    #[tokio::test]
+    async fn unroutable_failures_pass_through_untouched() {
+        // An unsupported path is not a rewritable chat request, so `open` must
+        // pass it upstream exactly as it arrived rather than pinning a tier.
+        let filter = make_filter("http://127.0.0.1:1/v1/chat/completions", "open");
+        let request = make_request("/v1/embeddings");
+        let mut ctx = make_ctx(&request, None);
+        let original = chat_body("hello");
+        let mut body = Some(original.clone());
+
+        let action = filter
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .expect("fail-open never returns an error");
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "on_failure: open must let an unroutable request through"
+        );
+        assert_eq!(
+            ctx.get_metadata(METADATA_DECISION),
+            Some("unrouted"),
+            "a request that cannot be rewritten must be recorded as unrouted"
+        );
+        assert!(
+            ctx.get_metadata(METADATA_CLUSTER).is_none(),
+            "an unrouted request must not select a Switchyard cluster"
+        );
+        assert_eq!(
+            body,
+            Some(original),
+            "an unrouted request must reach the upstream byte-for-byte unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_rewrite_failure_passes_through_when_open() {
+        // A JSON array parses, so routing gets as far as the judge path and fails
+        // on translation -- which is may-apply -- but the fallback rewrite then
+        // fails too, because an array has no `model` field to replace.
+        let filter = make_filter("http://127.0.0.1:1/v1/chat/completions", "open");
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, None);
+        let mut body = Some(Bytes::from_static(b"[1, 2, 3]"));
+
+        let action = filter
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .expect("fail-open never returns an error");
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "a failed fallback rewrite must still fail open"
+        );
+        assert_eq!(
+            ctx.get_metadata(METADATA_DECISION),
+            Some("unrouted"),
+            "a body the fallback cannot rewrite must end up unrouted, not pinned to a tier"
+        );
+        assert_eq!(
+            body,
+            Some(Bytes::from_static(b"[1, 2, 3]")),
+            "a failed rewrite must leave the body alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewritable_failures_reject_when_closed() {
+        let filter = make_filter("http://127.0.0.1:1/v1/chat/completions", "closed");
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, None);
+        let mut body = Some(chat_body("hello"));
+
+        let action = filter
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .expect("fail-closed rejects rather than erroring");
+
+        let FilterAction::Reject(rejection) = action else {
+            panic!("on_failure: closed must reject even when a tier could be applied");
+        };
+        assert_eq!(rejection.status, 503, "a rejected request must surface as 503");
+        assert_eq!(
+            ctx.get_metadata(METADATA_DECISION),
+            Some("rejected"),
+            "a rejection must be recorded as such"
         );
     }
 }
