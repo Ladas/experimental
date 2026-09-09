@@ -145,6 +145,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           build-args: |
             FEATURES=${{ env.FEATURES }}
+            VERSION=${{ steps.meta.outputs.version }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}

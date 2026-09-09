@@ -117,13 +117,19 @@ runs as usual.
 
 ## Container Details
 
-The `Containerfile` builds a minimal Alpine image:
+The `Containerfile` builds a Red Hat UBI9 image:
 
-- Static musl build using the release profile (LTO,
-  single codegen unit, stripped symbols)
+- Built on `ubi9/ubi`, shipped on `ubi9/ubi-minimal`,
+  both pinned by tag and digest
+- Rust toolchain from the checksum-pinned upstream
+  release tarball, so the image is not limited to the
+  version RHEL's AppStream ships
+- Release profile (LTO, single codegen unit, stripped
+  symbols), dynamically linked against glibc; TLS is
+  rustls, so no system OpenSSL is needed
 - Dependency layers cached via manifest-first stub
   builds, so source changes do not rebuild dependencies
-- Runs as a non-root user
+- Runs as the numeric non-root user 1001
 
 The template image runs the probe binary to completion.
 When scaffolding a long-running service, add `EXPOSE`

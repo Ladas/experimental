@@ -2747,12 +2747,14 @@ name = "praxis-experimental-server"
 version = "0.1.0"
 dependencies = [
  "cargo_metadata",
+ "clap",
  "praxis-ai-build-support",
  "praxis-ai-proxy",
  "praxis-experimental-filters",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-protocol",
+ "tracing",
 ]
 
 [[package]]
