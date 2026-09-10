@@ -21,6 +21,7 @@ pub(crate) struct RouteConfig {
     pub(crate) strong: TargetConfig,
     pub(crate) threshold: f64,
     pub(crate) on_failure: FailureMode,
+    pub(crate) session_floor: SessionFloor,
 }
 
 impl RouteConfig {
@@ -72,6 +73,17 @@ pub(crate) enum FailureMode {
     Closed,
 }
 
+/// Whether to enforce a session floor that prevents tier downgrades.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SessionFloor {
+    /// Once a session reaches Strong, it stays Strong (skip judge if already maxed).
+    #[default]
+    Enabled,
+    /// Each turn gets a fresh judge decision; no floor enforced.
+    Disabled,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Tier {
     Weak,
@@ -93,6 +105,11 @@ impl Tier {
             _ => None,
         }
     }
+
+    /// Returns `true` if this is the highest tier (no point calling the judge).
+    pub(crate) fn is_max(self) -> bool {
+        self == Self::Strong
+    }
 }
 
 #[derive(Deserialize)]
@@ -104,6 +121,8 @@ struct RawConfig {
     threshold: f64,
     #[serde(default)]
     on_failure: FailureMode,
+    #[serde(default)]
+    session_floor: SessionFloor,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +218,7 @@ pub(crate) fn parse(yaml: &serde_yaml::Value) -> Result<RouteConfig, FilterError
         },
         threshold: raw.threshold,
         on_failure: raw.on_failure,
+        session_floor: raw.session_floor,
     })
 }
 
@@ -249,6 +269,10 @@ targets:
             matches!(config.on_failure, FailureMode::Open),
             "routing failures default to passing traffic through"
         );
+        assert!(
+            matches!(config.session_floor, SessionFloor::Enabled),
+            "session floor defaults to enabled"
+        );
     }
 
     #[test]
@@ -257,6 +281,7 @@ targets:
         yaml["judge"]["timeout_ms"] = serde_yaml::Value::Number(serde_yaml::Number::from(250));
         yaml["judge"]["verify_tls"] = serde_yaml::Value::Bool(false);
         yaml["on_failure"] = serde_yaml::Value::String("closed".to_owned());
+        yaml["session_floor"] = serde_yaml::Value::String("disabled".to_owned());
         let config = parse(&yaml).expect("should parse");
         assert_eq!(
             config.judge.timeout_ms, 250,
@@ -266,6 +291,10 @@ targets:
         assert!(
             matches!(config.on_failure, FailureMode::Closed),
             "on_failure: closed must be honoured"
+        );
+        assert!(
+            matches!(config.session_floor, SessionFloor::Disabled),
+            "session_floor: disabled must be honoured"
         );
     }
 
@@ -428,6 +457,12 @@ judge:
     #[test]
     fn tier_ordering() {
         assert!(Tier::Weak < Tier::Strong);
+    }
+
+    #[test]
+    fn tier_is_max() {
+        assert!(!Tier::Weak.is_max(), "Weak is not the maximum tier");
+        assert!(Tier::Strong.is_max(), "Strong is the maximum tier");
     }
 
     #[test]

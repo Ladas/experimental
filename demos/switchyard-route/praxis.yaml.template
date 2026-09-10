@@ -28,6 +28,7 @@ filter_chains:
             cluster: strong-cluster
             model: mock-strong
         on_failure: open
+        session_floor: __SESSION_FLOOR__
       - filter: load_balancer
         clusters:
           - name: weak-cluster

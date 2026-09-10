@@ -1,34 +1,46 @@
 # `switchyard_route`: Capability-mode Mixture-of-Models routing
 
 > **Status: POC** ([praxis-proxy/experimental#2](https://github.com/praxis-proxy/experimental/issues/2),
-> mid-session failure: [#19](https://github.com/praxis-proxy/experimental/issues/19)).
+> mid-session failure: [#19](https://github.com/praxis-proxy/experimental/issues/19),
+> session floor: [#20](https://github.com/praxis-proxy/experimental/issues/20)).
 > Built against NVIDIA NeMo Switchyard `=0.2.0` (pre-alpha).
 
-Decision-only router: a judge classifies each request; Switchyard returns
-`weak` / `strong`; the filter maps that tag to `(cluster, model)` and selects
-the Praxis cluster. Switchyard never sees provider names.
+Decision-only router: a judge classifies a turn unless the session floor
+already answers it. Switchyard returns `weak` / `strong`; the filter maps
+that tag to `(cluster, model)` and selects the Praxis cluster. Switchyard
+never sees provider names.
 
-A live judge success is remembered per session (in-process). If the judge
-fails later in the same chat, `on_failure: open` reuses that tier instead of
-thrashing or continuing unrouted.
+**Session floor** (default: enabled): once a session reaches Strong, it stays
+Strong for later turns. The judge is skipped when the stored tier is already
+Strong (`decision=floor_skip`). Weak still calls the judge and may rise.
+
+If the judge fails mid-chat and `on_failure: open`, a stored success is
+reused (`reuse`). An empty store serves Strong once without writing the map
+(`default_strong`).
 
 ## Flow
 
-1. **`on_request_body`**: buffer JSON, derive the session key, decode OpenAI
-   chat → Switchyard IR, drive `run_stream`, serve the judge `CallLlm` via
-   `SubRequestClient`, rewrite `model`, stash cluster metadata. On a real
-   success, store the tier for that key.
+1. **`on_request_body`**: buffer JSON, require `*/chat/completions`, derive
+   the session key.
+   - If `session_floor` is enabled and the stored tier is Strong: rewrite
+     Strong, set `decision=floor_skip`, refresh idle TTL. The judge is not
+     called and the map is not rewritten.
+   - Otherwise: decode OpenAI chat → Switchyard IR, drive `run_stream`,
+     serve the judge `CallLlm` via `SubRequestClient`, rewrite `model`,
+     stash cluster metadata. On a live judge success, write the map (highest
+     tier when the floor is enabled; last verdict when it is disabled).
+   A rewrite failure on either path follows `on_failure` (`unrouted` or 503).
 2. **`on_request`**: apply `ctx.cluster` from metadata.
 
 ### Metadata
 
 | Key | When |
 | --- | --- |
-| `switchyard_route.cluster` | A Weak/Strong cluster was applied (live, reuse, or default Strong) |
-| `switchyard_route.decision` | `routed` / `reuse` / `default_strong` / `rejected` / `unrouted` |
-| `switchyard_route.error` | Judge/decode failure (also present on reuse and default Strong) |
+| `switchyard_route.cluster` | A Weak/Strong cluster was applied (live, floor_skip, reuse, or default Strong) |
+| `switchyard_route.decision` | `routed` / `floor_skip` / `reuse` / `default_strong` / `rejected` / `unrouted` |
+| `switchyard_route.error` | Set on any routing failure (`reuse`, `default_strong`, `rejected`, `unrouted`). Not set on `routed` or `floor_skip`. |
 
-Logs use the same tokens: `switchyard_route: routed`, `reuse`,
+Logs use the same tokens: `switchyard_route: routed`, `floor_skip`, `reuse`,
 `default_strong`, `routing failed`, `fail-open`.
 
 ## Session key
@@ -43,15 +55,13 @@ Recomputed on every request (the key is not stored as a token to compare):
    history, or send the header.
 3. Neither → no session. The turn behaves like an empty store.
 
-The map holds only `key → last real judge success`. Default Strong and 503
-are never written. Idle TTL is 30 minutes; cap is 10_000 entries (LRU).
-Lost on process restart or replica hop
+The map holds the **floor** (highest tier seen) per session key when
+`session_floor` is enabled. Tier can only go up, never down. When
+`session_floor` is disabled, the map stores the last live judge success and
+may drop. Default Strong and 503 are never written. Idle TTL is 30
+minutes; cap is 10,000 entries (LRU). Lost on process restart or replica hop
 ([#3](https://github.com/praxis-proxy/experimental/issues/3)). Two chats
 without a header that start with the same user line share a key.
-
-Healthy-path “no downgrade” while the judge is up is
-[#20](https://github.com/praxis-proxy/experimental/issues/20), not this filter
-path.
 
 ## Configuration
 
@@ -71,11 +81,19 @@ path.
     strong:
       cluster: strong-cluster
       model: mock-strong
-  on_failure: open   # open | closed
+  on_failure: open      # open | closed
+  session_floor: enabled  # enabled (default) | disabled
 ```
 
 - Path: `*/chat/completions` only.
 - Secrets: `judge.auth.value_env` only (never inline).
+
+### `session_floor`
+
+| Mode | Behavior |
+| --- | --- |
+| `enabled` (default) | Once a session reaches Strong, later turns stay Strong and skip the judge (`decision=floor_skip`). While the stored tier is still Weak, the judge still runs and may raise the floor. |
+| `disabled` | Every turn gets a fresh judge decision. The request and the stored tier can drop from Strong to Weak. |
 
 ### `on_failure`
 
@@ -87,6 +105,10 @@ path.
 Wrong path or unparsable JSON still fail-open unrouted or 503; those
 requests are not rewritten to a sticky tier.
 
+A Strong floor skips the judge, so a down judge on that session is
+`floor_skip`, not `reuse`. This table applies only when the judge (or decode)
+actually runs and fails.
+
 ## Demo
 
 ```console
@@ -94,8 +116,9 @@ cd demos/switchyard-route && ./run-demo.sh
 ```
 
 Mock judge + echo upstreams. Easy → `served_by=weak-upstream`; hard →
-`served_by=strong-upstream`. After a Strong session turn, the script takes
-the judge down: the next easy turn on the same
-`x-switchyard-session-id` stays Strong (`reuse`), and a new session while
-the judge is down gets default Strong. Details in
+`served_by=strong-upstream`. On one session with the judge up: easy → Weak,
+hard → Strong, easy again stays Strong (`floor_skip`, no judge call). A Weak
+session with the judge down reuses Weak (`reuse`). A new session while the
+judge is down gets default Strong. A restart with `session_floor: disabled`
+allows Strong → Weak on the next easy turn. Details in
 [`demos/switchyard-route/`](../demos/switchyard-route/README.md).

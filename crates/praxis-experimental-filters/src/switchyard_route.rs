@@ -1,8 +1,9 @@
 //! `switchyard_route`: Mixture-of-Models routing via NVIDIA `NeMo` Switchyard
 //! (Capability mode). Decision-only: judge → weak/strong tier → cluster+model.
 //!
-//! Demo greps `judge verdict` / `routed` / `reuse` / `default_strong` /
-//! `routing failed` / `fail-open` in `demos/switchyard-route/run-demo.sh`.
+//! Demo greps `judge verdict` / `routed` / `floor_skip` / `reuse` /
+//! `default_strong` / `routing failed` / `fail-open` in
+//! `demos/switchyard-route/run-demo.sh`.
 
 #![expect(
     clippy::large_futures,
@@ -28,7 +29,7 @@ use praxis_filter::{BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter,
 use switchyard_libsy::Algorithm;
 use tracing::{debug, warn};
 
-use self::config::{FailureMode, RouteConfig, Tier};
+use self::config::{RouteConfig, SessionFloor, Tier};
 
 /// Metadata key for the chosen cluster (body phase → `on_request`).
 const METADATA_CLUSTER: &str = "switchyard_route.cluster";
@@ -78,6 +79,9 @@ impl SwitchyardRouteFilter {
     }
 
     /// Runs the routing decision: parse body, call judge, pick tier, rewrite.
+    ///
+    /// When `session_floor` is enabled and the session is already at Strong,
+    /// the judge is skipped entirely (the outcome would be Strong regardless).
     async fn route(&self, ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) -> Result<Tier, RouteError> {
         let value = parse_body(body.as_ref())?;
 
@@ -88,6 +92,22 @@ impl SwitchyardRouteFilter {
         }
 
         let session_key = session::session_key_from_request(&ctx.request.headers, &value);
+        let now = Instant::now();
+
+        // Floor optimization: if the session floor is already at max, skip the judge.
+        if self.config.session_floor == SessionFloor::Enabled
+            && let Some(key) = &session_key
+        {
+            let floor = self.lock_sessions().last_success(key, now);
+            if let Some(floor) = floor.filter(|tier| tier.is_max()) {
+                let cluster = rewrite_for_tier(&self.config, body, value, floor)?;
+                ctx.set_metadata(METADATA_CLUSTER, cluster);
+                ctx.set_metadata(METADATA_DECISION, failure::DECISION_FLOOR_SKIP);
+                debug!(tier = %floor.tag(), "switchyard_route: floor_skip");
+                return Ok(floor);
+            }
+        }
+
         let llm_request = decode_for_judge(&value)?;
         let client = ctx
             .subrequest_client
@@ -98,7 +118,8 @@ impl SwitchyardRouteFilter {
         ctx.set_metadata(METADATA_CLUSTER, cluster);
         ctx.set_metadata(METADATA_DECISION, failure::DECISION_ROUTED);
         if let Some(key) = session_key {
-            self.lock_sessions().remember(&key, tier, Instant::now());
+            self.lock_sessions()
+                .remember(&key, tier, now, self.config.session_floor);
         }
         Ok(tier)
     }
@@ -106,13 +127,6 @@ impl SwitchyardRouteFilter {
     /// Recovers from a poisoned mutex so one panicked request cannot stick the filter.
     fn lock_sessions(&self) -> MutexGuard<'_, session::SessionStore> {
         self.sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Looks up the last real judge success for this request's session key.
-    fn lookup_remembered(&self, ctx: &HttpFilterContext<'_>, body: Option<&Bytes>) -> Option<Tier> {
-        let value = parse_body(body).ok()?;
-        let key = session::session_key_from_request(&ctx.request.headers, &value)?;
-        self.lock_sessions().last_success(&key, Instant::now())
     }
 
     /// Records the error and applies `on_failure` (reuse / default Strong / 503 / unrouted).
@@ -125,35 +139,32 @@ impl SwitchyardRouteFilter {
         warn!(error = %err, "switchyard_route: routing failed");
         record_error_metadata(ctx, err);
         let may_apply = err.may_apply_failure_tier();
-        let remembered = may_apply.then(|| self.lookup_remembered(ctx, body.as_ref())).flatten();
-        self.dispatch_failure(ctx, body, may_apply, remembered)
-    }
-
-    /// Maps a failure disposition onto HTTP continue / 503 / rewrite.
-    fn dispatch_failure(
-        &self,
-        ctx: &mut HttpFilterContext<'_>,
-        body: &mut Option<Bytes>,
-        may_apply: bool,
-        remembered: Option<Tier>,
-    ) -> FilterAction {
+        let parsed = may_apply.then(|| parse_body(body.as_ref()).ok()).flatten();
+        let remembered = parsed.as_ref().and_then(|value| {
+            let key = session::session_key_from_request(&ctx.request.headers, value)?;
+            self.lock_sessions().last_success(&key, Instant::now())
+        });
         match failure::failure_action(self.config.on_failure, may_apply, remembered) {
             failure::FailureAction::Reject => reject_closed(ctx),
             failure::FailureAction::Unrouted => fail_open_unrouted(ctx),
-            failure::FailureAction::Apply(apply) => self.apply_failure_tier(ctx, body, apply),
+            failure::FailureAction::Apply(apply) => match parsed {
+                Some(value) => self.apply_failure_tier(ctx, body, apply, value),
+                None => fail_open_unrouted(ctx),
+            },
         }
     }
 
     /// Rewrites `model` and cluster metadata for an `open` failure apply.
+    ///
+    /// Closed already rejected in [`failure::failure_action`]; this path is
+    /// `on_failure: open` only. If rewrite fails, the request continues unrouted.
     fn apply_failure_tier(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         apply: failure::FailureApply,
+        value: serde_json::Value,
     ) -> FilterAction {
-        let Ok(value) = parse_body(body.as_ref()) else {
-            return fail_open_or_reject(ctx, self.config.on_failure);
-        };
         match rewrite_for_tier(&self.config, body, value, apply.tier) {
             Ok(cluster) => {
                 ctx.set_metadata(METADATA_CLUSTER, cluster);
@@ -163,7 +174,7 @@ impl SwitchyardRouteFilter {
             },
             Err(err) => {
                 debug!(error = %err, "switchyard_route: fallback rewrite failed");
-                fail_open_or_reject(ctx, self.config.on_failure)
+                fail_open_unrouted(ctx)
             },
         }
     }
@@ -385,7 +396,9 @@ impl HttpFilter for SwitchyardRouteFilter {
 
         match self.route(ctx, body).await {
             Ok(tier) => {
-                debug!(tier = %tier.tag(), "switchyard_route: routed");
+                if ctx.get_metadata(METADATA_DECISION) != Some(failure::DECISION_FLOOR_SKIP) {
+                    debug!(tier = %tier.tag(), "switchyard_route: routed");
+                }
                 Ok(FilterAction::Continue)
             },
             Err(err) => Ok(self.on_route_error(ctx, body, &err)),
@@ -626,14 +639,6 @@ fn fail_open_unrouted(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
     FilterAction::Continue
 }
 
-/// When rewrite itself fails, fall back to plain open/closed.
-fn fail_open_or_reject(ctx: &mut HttpFilterContext<'_>, mode: FailureMode) -> FilterAction {
-    match mode {
-        FailureMode::Closed => reject_closed(ctx),
-        FailureMode::Open => fail_open_unrouted(ctx),
-    }
-}
-
 /// Demo-greppable log line for reuse vs default Strong.
 fn log_failure_apply(apply: failure::FailureApply) {
     match apply.kind {
@@ -762,6 +767,23 @@ mod tests {
         request
     }
 
+    /// First turn: judge returns Strong so later turns can exercise floor-skip.
+    async fn seed_strong_floor(filter: &dyn HttpFilter, request: &Request, client: &SubRequestClient) {
+        let mut ctx = make_ctx(request, Some(client));
+        let mut body = Some(chat_body("complex question"));
+        drop(
+            filter
+                .on_request_body(&mut ctx, &mut body, true)
+                .await
+                .expect("first turn routes to Strong"),
+        );
+        assert_eq!(
+            ctx.get_metadata(METADATA_CLUSTER),
+            Some("strong-cluster"),
+            "seed turn must store a Strong floor"
+        );
+    }
+
     /// Builds a filter context, mirroring every field of `HttpFilterContext`.
     fn make_ctx<'ctx>(request: &'ctx Request, client: Option<&'ctx SubRequestClient>) -> HttpFilterContext<'ctx> {
         HttpFilterContext {
@@ -814,6 +836,11 @@ mod tests {
 
     /// Builds filter YAML pointing at `endpoint` with the given failure mode.
     fn config_yaml(endpoint: &str, on_failure: &str) -> serde_yaml::Value {
+        config_yaml_full(endpoint, on_failure, "enabled")
+    }
+
+    /// Builds filter YAML with an explicit `session_floor` setting.
+    fn config_yaml_full(endpoint: &str, on_failure: &str, session_floor: &str) -> serde_yaml::Value {
         let yaml = format!(
             concat!(
                 "judge:\n",
@@ -829,8 +856,9 @@ mod tests {
                 "    model: \"strong-model\"\n",
                 "threshold: 0.5\n",
                 "on_failure: {}\n",
+                "session_floor: {}\n",
             ),
-            endpoint, on_failure
+            endpoint, on_failure, session_floor
         );
         serde_yaml::from_str(&yaml).expect("test config YAML parses")
     }
@@ -838,6 +866,12 @@ mod tests {
     /// Builds a filter whose judge lives at `endpoint`.
     fn make_filter(endpoint: &str, on_failure: &str) -> Box<dyn HttpFilter> {
         SwitchyardRouteFilter::from_config(&config_yaml(endpoint, on_failure)).expect("test filter config is valid")
+    }
+
+    /// Builds a filter with an explicit `session_floor` setting.
+    fn make_filter_with_floor(endpoint: &str, on_failure: &str, session_floor: &str) -> Box<dyn HttpFilter> {
+        SwitchyardRouteFilter::from_config(&config_yaml_full(endpoint, on_failure, session_floor))
+            .expect("test filter config is valid")
     }
 
     /// A minimal `OpenAI` chat request body.
@@ -1947,6 +1981,285 @@ mod tests {
             ctx.get_metadata(METADATA_DECISION),
             Some("rejected"),
             "a rejection must be recorded as such"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Session floor: skip judge when floor is at max
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn floor_skip_when_session_already_at_strong() {
+        // Turn one: routes to Strong via the judge (unsupported prompt).
+        // Turn two: with the same session, floor is Strong, so judge is skipped.
+        let addr = spawn_judge_sequence(vec![
+            ("HTTP/1.1 200 OK", judge_body(&verdict(0.0, "LIM-2", "unsupported"))),
+            // Second response should never be reached due to floor_skip
+            ("HTTP/1.1 500 Internal Server Error", "should not be called".to_owned()),
+        ])
+        .await;
+        let filter = make_filter(&format!("http://{addr}/v1/chat/completions"), "open");
+        let client = make_client();
+        let request = make_request_with_session("/v1/chat/completions", "session-floor-test");
+
+        // First turn: judge returns Strong
+        let mut first_ctx = make_ctx(&request, Some(&client));
+        let mut first_body = Some(chat_body("complex question"));
+        drop(
+            filter
+                .on_request_body(&mut first_ctx, &mut first_body, true)
+                .await
+                .expect("first turn routes normally"),
+        );
+        assert_eq!(
+            first_ctx.get_metadata(METADATA_DECISION),
+            Some("routed"),
+            "first turn must be a live judge decision"
+        );
+        assert_eq!(
+            first_ctx.get_metadata(METADATA_CLUSTER),
+            Some("strong-cluster"),
+            "first turn must route to strong"
+        );
+
+        // Second turn: floor should skip the judge
+        let mut second_ctx = make_ctx(&request, Some(&client));
+        let mut second_body = Some(chat_body("simple follow-up"));
+        let action = filter
+            .on_request_body(&mut second_ctx, &mut second_body, true)
+            .await
+            .expect("second turn succeeds via floor");
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "floor_skip must let the request through"
+        );
+        assert_eq!(
+            second_ctx.get_metadata(METADATA_DECISION),
+            Some("floor_skip"),
+            "second turn must skip the judge due to floor"
+        );
+        assert_eq!(
+            second_ctx.get_metadata(METADATA_CLUSTER),
+            Some("strong-cluster"),
+            "floor_skip must route to the floor tier (Strong)"
+        );
+        let routed: serde_json::Value =
+            serde_json::from_slice(&second_body.expect("body is rewritten")).expect("body is JSON");
+        assert_eq!(
+            routed["model"], "strong-model",
+            "floor_skip must rewrite the model to the floor tier's target"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn floor_skip_rewrite_failure_follows_on_failure() {
+        // A JSON array parses and keeps the session header, so floor-skip runs,
+        // then rewrite_for_tier fails (not an object). Missing `model` still
+        // rewrites; only a non-object hits this path.
+        let addr = spawn_judge_sequence(vec![
+            ("HTTP/1.1 200 OK", judge_body(&verdict(0.0, "LIM-2", "unsupported"))),
+            ("HTTP/1.1 200 OK", judge_body(&verdict(0.0, "LIM-2", "unsupported"))),
+            ("HTTP/1.1 500 Internal Server Error", "should not be called".to_owned()),
+        ])
+        .await;
+        let endpoint = format!("http://{addr}/v1/chat/completions");
+        let client = make_client();
+        let unrewritable = Bytes::from_static(b"[1, 2, 3]");
+
+        let open = make_filter(&endpoint, "open");
+        let open_request = make_request_with_session("/v1/chat/completions", "session-floor-rewrite-open");
+        seed_strong_floor(open.as_ref(), &open_request, &client).await;
+        let mut open_ctx = make_ctx(&open_request, Some(&client));
+        let mut open_body = Some(unrewritable.clone());
+        let open_action = open
+            .on_request_body(&mut open_ctx, &mut open_body, true)
+            .await
+            .expect("open floor-skip rewrite failure must not error");
+        assert!(
+            matches!(open_action, FilterAction::Continue),
+            "on_failure: open must continue after a failed floor-skip rewrite"
+        );
+        assert_eq!(
+            open_ctx.get_metadata(METADATA_DECISION),
+            Some("unrouted"),
+            "a failed floor-skip rewrite must fail open unrouted, not reuse Strong"
+        );
+        assert!(
+            open_ctx.get_metadata(METADATA_CLUSTER).is_none(),
+            "an unrouted floor-skip rewrite must not select a cluster"
+        );
+        assert_eq!(
+            open_body,
+            Some(unrewritable.clone()),
+            "a failed rewrite must leave the body alone"
+        );
+
+        let closed = make_filter(&endpoint, "closed");
+        let closed_request = make_request_with_session("/v1/chat/completions", "session-floor-rewrite-closed");
+        seed_strong_floor(closed.as_ref(), &closed_request, &client).await;
+        let mut closed_ctx = make_ctx(&closed_request, Some(&client));
+        let mut closed_body = Some(unrewritable);
+        let closed_action = closed
+            .on_request_body(&mut closed_ctx, &mut closed_body, true)
+            .await
+            .expect("closed floor-skip rewrite failure must not error");
+        let FilterAction::Reject(rejection) = closed_action else {
+            panic!("on_failure: closed must reject when floor-skip rewrite fails");
+        };
+        assert_eq!(rejection.status, 503, "a rejected request must surface as 503");
+        assert_eq!(
+            closed_ctx.get_metadata(METADATA_DECISION),
+            Some("rejected"),
+            "a rejection must be recorded as such"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn floor_disabled_calls_judge_every_turn() {
+        // With session_floor: disabled, every turn calls the judge even after Strong.
+        let addr = spawn_judge_sequence(vec![
+            ("HTTP/1.1 200 OK", judge_body(&verdict(0.0, "LIM-2", "unsupported"))),
+            ("HTTP/1.1 200 OK", judge_body(&verdict(0.95, "SUP-1", "supported"))),
+        ])
+        .await;
+        let filter = make_filter_with_floor(&format!("http://{addr}/v1/chat/completions"), "open", "disabled");
+        let client = make_client();
+        let request = make_request_with_session("/v1/chat/completions", "session-no-floor");
+
+        // First turn: judge returns Strong
+        let mut first_ctx = make_ctx(&request, Some(&client));
+        let mut first_body = Some(chat_body("complex question"));
+        drop(
+            filter
+                .on_request_body(&mut first_ctx, &mut first_body, true)
+                .await
+                .expect("first turn routes normally"),
+        );
+        assert_eq!(
+            first_ctx.get_metadata(METADATA_CLUSTER),
+            Some("strong-cluster"),
+            "first turn routes to strong"
+        );
+
+        // Second turn: with floor disabled, judge is called and returns Weak
+        let mut second_ctx = make_ctx(&request, Some(&client));
+        let mut second_body = Some(chat_body("simple question"));
+        drop(
+            filter
+                .on_request_body(&mut second_ctx, &mut second_body, true)
+                .await
+                .expect("second turn routes normally"),
+        );
+
+        assert_eq!(
+            second_ctx.get_metadata(METADATA_DECISION),
+            Some("routed"),
+            "with floor disabled, judge is called every turn"
+        );
+        assert_eq!(
+            second_ctx.get_metadata(METADATA_CLUSTER),
+            Some("weak-cluster"),
+            "with floor disabled, tier can downgrade to Weak"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn floor_disabled_reuse_follows_last_verdict() {
+        // Disabled floor must not keep Strong in the map after a later Weak success.
+        let addr = spawn_judge_sequence(vec![
+            ("HTTP/1.1 200 OK", judge_body(&verdict(0.0, "LIM-2", "unsupported"))),
+            ("HTTP/1.1 200 OK", judge_body(&verdict(0.95, "SUP-1", "supported"))),
+            ("HTTP/1.1 500 Internal Server Error", "judge down".to_owned()),
+        ])
+        .await;
+        let filter = make_filter_with_floor(&format!("http://{addr}/v1/chat/completions"), "open", "disabled");
+        let client = make_client();
+        let request = make_request_with_session("/v1/chat/completions", "session-disabled-reuse");
+
+        let mut first_ctx = make_ctx(&request, Some(&client));
+        let mut first_body = Some(chat_body("complex question"));
+        drop(
+            filter
+                .on_request_body(&mut first_ctx, &mut first_body, true)
+                .await
+                .expect("first turn routes to Strong"),
+        );
+        let mut second_ctx = make_ctx(&request, Some(&client));
+        let mut second_body = Some(chat_body("simple question"));
+        drop(
+            filter
+                .on_request_body(&mut second_ctx, &mut second_body, true)
+                .await
+                .expect("second turn routes to Weak"),
+        );
+
+        let mut third_ctx = make_ctx(&request, Some(&client));
+        let mut third_body = Some(chat_body("follow-up"));
+        drop(
+            filter
+                .on_request_body(&mut third_ctx, &mut third_body, true)
+                .await
+                .expect("third turn fail-open reuses the last live verdict"),
+        );
+        assert_eq!(
+            third_ctx.get_metadata(METADATA_DECISION),
+            Some("reuse"),
+            "judge failure must reuse the stored tier"
+        );
+        assert_eq!(
+            third_ctx.get_metadata(METADATA_CLUSTER),
+            Some("weak-cluster"),
+            "disabled floor must reuse Weak after a Weak live success"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn floor_does_not_skip_judge_when_at_weak() {
+        // When floor is at Weak, judge is still called (might escalate to Strong).
+        let addr = spawn_judge_sequence(vec![
+            ("HTTP/1.1 200 OK", judge_body(&verdict(0.95, "SUP-1", "supported"))),
+            ("HTTP/1.1 200 OK", judge_body(&verdict(0.0, "LIM-2", "unsupported"))),
+        ])
+        .await;
+        let filter = make_filter(&format!("http://{addr}/v1/chat/completions"), "open");
+        let client = make_client();
+        let request = make_request_with_session("/v1/chat/completions", "session-weak-then-strong");
+
+        // First turn: judge returns Weak
+        let mut first_ctx = make_ctx(&request, Some(&client));
+        let mut first_body = Some(chat_body("simple question"));
+        drop(
+            filter
+                .on_request_body(&mut first_ctx, &mut first_body, true)
+                .await
+                .expect("first turn routes normally"),
+        );
+        assert_eq!(
+            first_ctx.get_metadata(METADATA_CLUSTER),
+            Some("weak-cluster"),
+            "first turn routes to weak"
+        );
+
+        // Second turn: floor is Weak, so judge is called and escalates to Strong
+        let mut second_ctx = make_ctx(&request, Some(&client));
+        let mut second_body = Some(chat_body("complex question"));
+        drop(
+            filter
+                .on_request_body(&mut second_ctx, &mut second_body, true)
+                .await
+                .expect("second turn routes normally"),
+        );
+
+        assert_eq!(
+            second_ctx.get_metadata(METADATA_DECISION),
+            Some("routed"),
+            "floor at Weak must still call the judge"
+        );
+        assert_eq!(
+            second_ctx.get_metadata(METADATA_CLUSTER),
+            Some("strong-cluster"),
+            "session must escalate from Weak to Strong"
         );
     }
 }

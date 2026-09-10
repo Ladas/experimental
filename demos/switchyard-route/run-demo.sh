@@ -13,6 +13,9 @@ SERVER_BIN="${CARGO_TARGET_DIR}/debug/praxis-experimental-server"
 JUDGE_ENDPOINT="${JUDGE_ENDPOINT:-http://127.0.0.1:18091/v1/chat/completions}"
 JUDGE_MODEL="${JUDGE_MODEL:-mock-switchyard-judge}"
 MOCKS_PID=""
+SERVER_PID=""
+SERVER_LOG=/tmp/switchyard-demo-server.log
+MOCKS_LOG=/tmp/switchyard-demo-mocks.log
 
 cleanup() {
   kill "${SERVER_PID:-}" 2>/dev/null || true
@@ -20,12 +23,72 @@ cleanup() {
 }
 trap cleanup EXIT
 
+render_config() {
+  local floor=$1
+  sed -e "s|__JUDGE_ENDPOINT__|${JUDGE_ENDPOINT}|" \
+    -e "s|__JUDGE_MODEL__|${JUDGE_MODEL}|" \
+    -e "s|__SESSION_FLOOR__|${floor}|" \
+    -e "/__JUDGE_AUTH_BLOCK__/d" \
+    praxis.yaml.template > praxis.yaml
+}
+
+wait_for_gateway() {
+  local _i
+  for _i in $(seq 1 60); do
+    if curl -sf -o /dev/null -m 2 -X POST "$GATEWAY" \
+      -H 'content-type: application/json' \
+      -d '{"model":"warmup","messages":[{"role":"user","content":"ping"}],"max_tokens":1}' 2>/dev/null; then
+      return 0
+    fi
+    if [[ -n "${SERVER_PID}" ]] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "server exited early; see server.log:" >&2
+      tail -n 40 "$SERVER_LOG" >&2 || true
+      exit 1
+    fi
+    sleep 0.5
+  done
+  echo "gateway did not become ready; see server.log" >&2
+  tail -n 40 "$SERVER_LOG" >&2 || true
+  exit 1
+}
+
+start_server() {
+  local append=${1:-}
+  if [[ "$append" == append ]]; then
+    RUST_LOG="${RUST_LOG:-info,praxis_experimental_filters=debug}" \
+      "$SERVER_BIN" >> "$SERVER_LOG" 2>&1 &
+  else
+    RUST_LOG="${RUST_LOG:-info,praxis_experimental_filters=debug}" \
+      "$SERVER_BIN" > "$SERVER_LOG" 2>&1 &
+  fi
+  SERVER_PID=$!
+  ln -sfn "$SERVER_LOG" server.log
+  wait_for_gateway
+}
+
+stop_server() {
+  if [[ -n "${SERVER_PID}" ]]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    sleep 0.2
+    kill -9 "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+  fi
+  local _i
+  for _i in $(seq 1 50); do
+    if ! python3 -c "import socket;s=socket.socket();s.settimeout(0.2);s.connect(('127.0.0.1',18080))" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+}
+
 echo "mode: local mocks (judge :18091, weak :18092, strong :18093)" >&2
-python3 upstreams.py > /tmp/switchyard-demo-mocks.log 2>&1 &
+python3 upstreams.py > "$MOCKS_LOG" 2>&1 &
 MOCKS_PID=$!
 sleep 0.3
 if ! kill -0 "$MOCKS_PID" 2>/dev/null; then
-  echo "mock servers failed; see /tmp/switchyard-demo-mocks.log" >&2
+  echo "mock servers failed; see ${MOCKS_LOG}" >&2
   exit 1
 fi
 
@@ -38,32 +101,10 @@ if [[ "${FORCE_REBUILD:-}" == "1" ]] \
   (cd "$REPO_ROOT" && cargo build -p praxis-experimental-server)
 fi
 
-sed -e "s|__JUDGE_ENDPOINT__|${JUDGE_ENDPOINT}|" \
-    -e "s|__JUDGE_MODEL__|${JUDGE_MODEL}|" \
-    -e "/__JUDGE_AUTH_BLOCK__/d" \
-    praxis.yaml.template > praxis.yaml
-
+render_config enabled
 pkill -f 'praxis-experimental-server' 2>/dev/null || true
 sleep 0.2
-
-RUST_LOG="${RUST_LOG:-info,praxis_experimental_filters=debug}" \
-  "$SERVER_BIN" > /tmp/switchyard-demo-server.log 2>&1 &
-SERVER_PID=$!
-ln -sfn /tmp/switchyard-demo-server.log server.log
-
-for _ in $(seq 1 60); do
-  if curl -sf -o /dev/null -m 10 -X POST "$GATEWAY" \
-       -H 'content-type: application/json' \
-       -d '{"model":"warmup","messages":[{"role":"user","content":"ping"}],"max_tokens":1}' 2>/dev/null; then
-    break
-  fi
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo "server exited early; see server.log:" >&2
-    tail -n 40 /tmp/switchyard-demo-server.log >&2 || true
-    exit 1
-  fi
-  sleep 0.5
-done
+start_server
 
 ask() {
   local label=$1 prompt=$2 session=${3:-} tmp body http curl_args
@@ -98,6 +139,22 @@ PY
   rm -f "$tmp"
 }
 
+# Newest matching lines from the gateway log, copied as written.
+print_route_logs() {
+  local count=$1
+  echo "from ${SERVER_LOG}:"
+  grep -E 'switchyard_route: (judge verdict|routed|floor_skip|reuse|default_strong)' "$SERVER_LOG" \
+    | tail -n "$count" || true
+}
+
+# Newest mock-judge line for this prompt, if the judge was called.
+print_judge_preview() {
+  local needle=${1:0:60}
+  echo "searching ${MOCKS_LOG} for preview='${needle}':"
+  grep -F "preview='${needle}'" "$MOCKS_LOG" | tail -n 1 \
+    || echo "(none — judge was not called for this prompt)"
+}
+
 set_judge() {
   local state=$1
   curl -sS -m 5 -o /dev/null -X POST "http://127.0.0.1:18091/control/${state}"
@@ -114,16 +171,58 @@ ask hard1 'Reverse-engineer an undocumented legacy billing service with no harne
 ask hard2 'From a blurry whiteboard photo with no image or OCR, recover every equation.'
 ask hard3 'Reproduce undocumented acme-vision tensor layouts with no golden files.'
 
-echo "=== mid-session judge down (expect reuse Strong, then default Strong) ==="
-ask session-hard 'Reverse-engineer an undocumented legacy billing service with no harness.' demo-anti-thrash
+echo "=== session floor, judge healthy (expect Weak then Strong then floor_skip Strong) ==="
+ask floor-easy 'Count to three.' demo-floor
+echo "logs:"
+print_route_logs 2
+print_judge_preview 'Count to three.'
+ask floor-hard 'Reverse-engineer an undocumented legacy billing service with no harness.' demo-floor
+echo "logs:"
+print_route_logs 2
+print_judge_preview 'Reverse-engineer an undocumented legacy billing service with no harness.'
+ask floor-stay 'Thanks, just say ok.' demo-floor
+echo "logs:"
+print_route_logs 1
+print_judge_preview 'Thanks, just say ok.'
+
+echo "=== mid-session judge down (expect reuse Weak, then default Strong) ==="
+ask reuse-weak-seed 'Count to four.' demo-reuse-weak
 set_judge down
-ask session-easy-after-down 'What is 2+2?' demo-anti-thrash
+ask reuse-weak-after 'What is 2+2?' demo-reuse-weak
 ask empty-store-while-down 'What is the capital of France?' demo-empty-store
 set_judge up
 
+echo "=== session_floor disabled (restart; expect Strong then Weak on the same session) ==="
+stop_server
+render_config disabled
+echo "session_floor: disabled" >&2
+start_server append
+ask disabled-hard 'Reverse-engineer an undocumented legacy billing service with no harness.' demo-no-floor
+ask disabled-easy 'What colour is the sky?' demo-no-floor
+
 echo
 echo "routing decisions (ignore warmup):"
-grep -E 'switchyard_route: (judge verdict|routed|reuse|default_strong|routing failed|fail-open)' /tmp/switchyard-demo-server.log || true
+grep -E 'switchyard_route: (judge verdict|routed|floor_skip|reuse|default_strong|routing failed|fail-open)' \
+  "$SERVER_LOG" || true
 echo
-echo "upstreams (4× weak = warmup + 3 easy; 3 one-shot hard + session-hard + reuse + default Strong):"
-grep -nE 'weak-upstream|strong-upstream' /tmp/switchyard-demo-mocks.log || true
+echo "upstreams:"
+grep -nE 'weak-upstream|strong-upstream' "$MOCKS_LOG" || true
+
+missing=0
+for token in floor_skip reuse default_strong; do
+  if ! grep -q "switchyard_route: ${token}" "$SERVER_LOG"; then
+    echo "missing expected log: switchyard_route: ${token}" >&2
+    missing=1
+  fi
+done
+if grep -qF "preview='Thanks, just say ok.'" "$MOCKS_LOG"; then
+  echo "judge was called on the floor-stay prompt; expected floor_skip" >&2
+  missing=1
+fi
+if ! grep -qF "preview='What colour is the sky?'" "$MOCKS_LOG"; then
+  echo "judge was not called on the disabled-easy prompt; expected a fresh Weak verdict" >&2
+  missing=1
+fi
+if [[ "$missing" -ne 0 ]]; then
+  exit 1
+fi

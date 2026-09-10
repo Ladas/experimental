@@ -9,7 +9,7 @@ use std::{
 use http::HeaderMap;
 use serde_json::Value;
 
-use super::config::Tier;
+use super::config::{SessionFloor, Tier};
 
 /// HTTP header used as the session key when present and non-empty.
 pub(crate) const SESSION_ID_HEADER: &str = "x-switchyard-session-id";
@@ -34,7 +34,10 @@ impl SessionKey {
     }
 }
 
-/// Last successful judge tier for in-process session keys.
+/// In-process map of session keys to a stored tier.
+///
+/// With [`SessionFloor::Enabled`] this is a one-way floor. With
+/// [`SessionFloor::Disabled`] it is the last live judge success.
 #[derive(Debug)]
 pub(crate) struct SessionStore {
     /// Live entries keyed by [`SessionKey::as_str`].
@@ -52,7 +55,7 @@ pub(crate) struct SessionStore {
 /// Live map value: last judge success, idle timestamp, recency stamp.
 #[derive(Debug, Clone, Copy)]
 struct SessionEntry {
-    /// Last judge success for this key.
+    /// Stored tier for this key (floor when enabled, last live success when disabled).
     tier: Tier,
     /// Last remember or hit time (idle TTL).
     last_touch: Instant,
@@ -98,20 +101,36 @@ impl SessionStore {
     }
 
     /// Records a real judge success. Default Strong / 503 must not call this.
-    pub(crate) fn remember(&mut self, key: &SessionKey, tier: Tier, now: Instant) {
+    ///
+    /// With [`SessionFloor::Enabled`], the stored tier only rises. With
+    /// [`SessionFloor::Disabled`], the new verdict replaces whatever was stored.
+    pub(crate) fn remember(&mut self, key: &SessionKey, tier: Tier, now: Instant, session_floor: SessionFloor) {
         self.sweep(now);
         let seq = self.bump_seq();
         let map_key = key.as_str().to_owned();
+        let effective_tier = self.tier_to_store(&map_key, tier, session_floor);
+
         self.entries.insert(
             map_key.clone(),
             SessionEntry {
-                tier,
+                tier: effective_tier,
                 last_touch: now,
                 seq,
             },
         );
         self.recency.push_back(RecencyNode { map_key, seq });
         self.evict_over_capacity();
+    }
+
+    /// Floor on: `max(stored, incoming)`. Floor off: incoming as-is.
+    fn tier_to_store(&self, map_key: &str, incoming: Tier, session_floor: SessionFloor) -> Tier {
+        match session_floor {
+            SessionFloor::Disabled => incoming,
+            SessionFloor::Enabled => self
+                .entries
+                .get(map_key)
+                .map_or(incoming, |existing| std::cmp::max(existing.tier, incoming)),
+        }
     }
 
     /// Returns the remembered tier, refreshing idle TTL. Expired keys miss.
@@ -305,7 +324,7 @@ mod tests {
     use serde_json::json;
 
     use super::{SESSION_ID_HEADER, SessionKey, SessionStore, session_key_from_request};
-    use crate::switchyard_route::config::Tier;
+    use crate::switchyard_route::config::{SessionFloor, Tier};
 
     fn header_map(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -413,7 +432,7 @@ mod tests {
             inner: "h:demo".to_owned(),
         };
         let now = Instant::now();
-        store.remember(&key, Tier::Strong, now);
+        store.remember(&key, Tier::Strong, now, SessionFloor::Enabled);
         assert_eq!(store.last_success(&key, now), Some(Tier::Strong));
     }
 
@@ -424,7 +443,7 @@ mod tests {
             inner: "h:ttl".to_owned(),
         };
         let start = Instant::now();
-        store.remember(&key, Tier::Weak, start);
+        store.remember(&key, Tier::Weak, start, SessionFloor::Enabled);
         let later = start + Duration::from_secs(11);
         assert_eq!(store.last_success(&key, later), None, "idle TTL must miss");
     }
@@ -442,9 +461,9 @@ mod tests {
             inner: "h:c".to_owned(),
         };
         let now = Instant::now();
-        store.remember(&key_a, Tier::Weak, now);
-        store.remember(&key_b, Tier::Weak, now);
-        store.remember(&key_c, Tier::Strong, now);
+        store.remember(&key_a, Tier::Weak, now, SessionFloor::Enabled);
+        store.remember(&key_b, Tier::Weak, now, SessionFloor::Enabled);
+        store.remember(&key_c, Tier::Strong, now, SessionFloor::Enabled);
         assert_eq!(store.last_success(&key_a, now), None, "oldest key must be evicted");
         assert_eq!(store.last_success(&key_b, now), Some(Tier::Weak));
         assert_eq!(store.last_success(&key_c, now), Some(Tier::Strong));
@@ -463,10 +482,10 @@ mod tests {
             inner: "h:c".to_owned(),
         };
         let now = Instant::now();
-        store.remember(&key_a, Tier::Strong, now);
-        store.remember(&key_b, Tier::Weak, now);
+        store.remember(&key_a, Tier::Strong, now, SessionFloor::Enabled);
+        store.remember(&key_b, Tier::Weak, now, SessionFloor::Enabled);
         assert_eq!(store.last_success(&key_a, now), Some(Tier::Strong));
-        store.remember(&key_c, Tier::Weak, now);
+        store.remember(&key_c, Tier::Weak, now, SessionFloor::Enabled);
         assert_eq!(
             store.last_success(&key_a, now),
             Some(Tier::Strong),
@@ -476,16 +495,48 @@ mod tests {
     }
 
     #[test]
-    fn remember_overwrites_tier_without_growing_forever() {
+    fn remember_upgrades_tier_from_weak_to_strong() {
         let mut store = SessionStore::new(Duration::from_secs(60), 1);
         let key = SessionKey {
             inner: "h:one".to_owned(),
         };
         let now = Instant::now();
-        store.remember(&key, Tier::Weak, now);
-        store.remember(&key, Tier::Strong, now);
+        store.remember(&key, Tier::Weak, now, SessionFloor::Enabled);
+        store.remember(&key, Tier::Strong, now, SessionFloor::Enabled);
         assert_eq!(store.last_success(&key, now), Some(Tier::Strong));
         assert_eq!(store.entries.len(), 1, "overwrite must not add a second live entry");
+    }
+
+    #[test]
+    fn remember_does_not_downgrade_tier_from_strong_to_weak() {
+        let mut store = SessionStore::new(Duration::from_secs(60), 8);
+        let key = SessionKey {
+            inner: "h:floor".to_owned(),
+        };
+        let now = Instant::now();
+        store.remember(&key, Tier::Strong, now, SessionFloor::Enabled);
+        store.remember(&key, Tier::Weak, now, SessionFloor::Enabled);
+        assert_eq!(
+            store.last_success(&key, now),
+            Some(Tier::Strong),
+            "floor semantics: Strong must not downgrade to Weak"
+        );
+    }
+
+    #[test]
+    fn remember_replaces_tier_when_floor_disabled() {
+        let mut store = SessionStore::new(Duration::from_secs(60), 8);
+        let key = SessionKey {
+            inner: "h:no-floor".to_owned(),
+        };
+        let now = Instant::now();
+        store.remember(&key, Tier::Strong, now, SessionFloor::Disabled);
+        store.remember(&key, Tier::Weak, now, SessionFloor::Disabled);
+        assert_eq!(
+            store.last_success(&key, now),
+            Some(Tier::Weak),
+            "disabled floor must store the latest live verdict"
+        );
     }
 
     #[test]
@@ -498,8 +549,8 @@ mod tests {
             inner: "h:hot".to_owned(),
         };
         let now = Instant::now();
-        store.remember(&quiet, Tier::Weak, now);
-        store.remember(&hot, Tier::Strong, now);
+        store.remember(&quiet, Tier::Weak, now, SessionFloor::Enabled);
+        store.remember(&hot, Tier::Strong, now, SessionFloor::Enabled);
         for _ in 0..40 {
             assert_eq!(store.last_success(&hot, now), Some(Tier::Strong));
         }

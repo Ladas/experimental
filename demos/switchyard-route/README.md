@@ -10,14 +10,29 @@ No Kubernetes cluster and no real LLM — only loopback mocks.
 
 1. Three easy prompts → `served_by=weak-upstream`
 2. Three hard prompts → `served_by=strong-upstream`
-3. Mid-session: hard turn with `x-switchyard-session-id`, then judge down,
-   then an easy turn on the **same** session → still `served_by=strong-upstream`
-   and a `switchyard_route: reuse` log (not a fresh Weak verdict)
-4. A **new** session while the judge is still down → Strong with
+3. Session floor (judge **up**, `session_floor: enabled`, same
+   `x-switchyard-session-id`):
+   - easy → Weak (`routed`)
+   - hard → Strong (`routed`, floor can still rise)
+   - easy again → Strong (`floor_skip`); the mock judge is **not** called.
+     After that turn the script prints the gateway `floor_skip` line. The mock
+     log must not contain `preview='Thanks, just say ok.'` — that would mean
+     the judge saw the prompt.
+4. Mid-session: **Weak** turn, then judge down, then another easy turn on the
+   **same** session → still Weak and a `switchyard_route: reuse` log.
+   (A Strong floor never calls the judge, so judge-down after Strong is
+   `floor_skip`, not `reuse`.)
+5. A **new** session while the judge is still down → Strong with
    `switchyard_route: default_strong` (empty store; not written as a success)
-5. Gateway logs with `switchyard_route: judge verdict` / `routed` / `reuse` /
+6. Restart with `session_floor: disabled`: hard then easy on one session →
+   Strong then Weak (`routed` both times; downgrade allowed)
+7. Gateway logs with `judge verdict` / `routed` / `floor_skip` / `reuse` /
    `default_strong`
-6. Mock logs showing judge `p_solve` and which upstream answered
+8. Mock logs showing judge `p_solve` and which upstream answered
+
+The script fails if `floor_skip`, `reuse`, or `default_strong` are missing,
+if the floor-stay prompt reached the judge, or if the disabled-easy prompt
+did not reach the judge.
 
 ## Quick start
 
@@ -30,10 +45,14 @@ The script:
 
 1. Starts `upstreams.py` (judge `:18091`, weak `:18092`, strong `:18093`)
 2. Builds `praxis-experimental-server` if needed
-3. Renders `praxis.yaml` from `praxis.yaml.template`
+3. Renders `praxis.yaml` from `praxis.yaml.template` with
+   `session_floor: enabled`
 4. Starts the gateway on `:18080`
-5. Sends 3 easy + 3 hard prompts, then the mid-session judge-down scenario,
-   and greps the logs
+5. Sends one-shot easy/hard prompts, the healthy-path floor sequence, then
+   the mid-session judge-down scenario
+6. Restarts the gateway with `session_floor: disabled` and sends Strong then
+   Weak on one session
+7. Greps the logs and checks the floor assertions
 
 ## Ports
 
@@ -57,7 +76,7 @@ covered by unit tests, not this script.
 | --- | --- |
 | `run-demo.sh` | One-shot demo driver |
 | `upstreams.py` | Mock judge + weak/strong echo servers |
-| `praxis.yaml.template` | Full Praxis config (placeholders for judge) |
+| `praxis.yaml.template` | Full Praxis config (placeholders for judge and `session_floor`) |
 | `praxis.yaml` | Generated at run time (gitignored) |
 | `server.log` | Symlink to gateway log (gitignored) |
 
@@ -77,7 +96,7 @@ return 503.
 ```text
 Client
   → Gateway :18080
-    → switchyard_route (judge callout :18091)
+    → switchyard_route (judge callout :18091, skipped on floor_skip)
     → load_balancer
       → weak :18092  or  strong :18093
 ```

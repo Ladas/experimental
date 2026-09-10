@@ -11,6 +11,9 @@ pub(crate) const DECISION_REJECTED: &str = "rejected";
 /// Metadata / log token when fail-open cannot apply a tier.
 pub(crate) const DECISION_UNROUTED: &str = "unrouted";
 
+/// Metadata / log token when the session floor is already at max (judge skipped).
+pub(crate) const DECISION_FLOOR_SKIP: &str = "floor_skip";
+
 /// How to finish a request after the judge (or decode) failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailureAction {
