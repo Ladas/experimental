@@ -32,6 +32,12 @@ name = "praxis-experimental-server"
 path = "src/main.rs"
 
 [dependencies]
+# CLI argument parsing, matching praxis-ai's own bin (-c/--config).
+clap = { version = "4.6.6", features = ["derive"] }
+
+# Startup diagnostics (the "no config file found" warning).
+tracing.workspace = true
+
 # Direct dependency on the filters crate is what makes it discoverable: the
 # build script scans this crate's direct runtime deps for the
 # `[package.metadata.praxis-filters]` marker.
