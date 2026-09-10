@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# The AI gateway demo on a KIND cluster, driven by forge.
+#
+#   ./demo-kind up ollama         local model, no key, no cost
+#   ./demo-kind up openai         hosted; asks once for the key and stores it
+#   ./demo-kind verify            run the checks
+#   ./demo-kind urls              print the dashboard links
+#   ./demo-kind down              delete the cluster
+#   ./demo-kind forget openai     delete the stored key
+#
+# Providers: ollama, openai, anthropic, openrouter -- one configs/<name>.yaml
+# each. See docs/kind.md for the same steps run by hand.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+DEMO_CMD="./demo-kind"
+# shellcheck source=scripts/demo-lib.sh
+. scripts/demo-lib.sh
+
+STATE_FILE=".demo-kind"
+CLUSTER="ai-gw-local"
+DEPLOY_IMAGE="praxis-experimental:ai-gw"
+STACKS="prometheus tempo otel-collector praxis-deploy dashboards perses"
+
+# Fixed by extraPortMappings in forge.yaml, which KIND applies when the node
+# container is created. Changing them needs a down and up.
+GW_PORT=38080
+ADMIN=38901
+PERSES=33001
+PROM=39090
+GRAFANA=33000
+
+# Whatever keys are in scope become env vars on the gateway pod: the keychain
+# entries loaded by the library, plus anything exported for this run. The
+# Deployment marks the Secret optional, so no keys at all is fine for ollama.
+apply_secret() {
+  local -a args=()
+  local var
+  for var in $(provider_key_vars); do
+    if [ -n "${!var:-}" ]; then
+      args+=(--from-literal="${var}=${!var}")
+    fi
+  done
+  kubectl create secret generic praxis-provider-keys "${args[@]}" \
+    --dry-run=client -o yaml | kubectl apply -f -
+}
+
+up() {
+  local s
+  command -v praxis-forge > /dev/null 2>&1 \
+    || die "praxis-forge not found. Install it with: cargo install --locked --git https://github.com/praxis-proxy/forge"
+  # KIND loads from docker specifically; forge.yaml sets runtime.provider: docker.
+  ensure_image docker
+  ensure_ollama
+  ensure_key
+  printf '%s\n' "${PROVIDER}" > "${STATE_FILE}"
+
+  say "creating the cluster -- about three minutes, mostly Helm"
+  praxis-forge up --config forge.yaml
+  # manifests/praxis.yaml names the image literally, so a PRAXIS_IMAGE override
+  # has to be tagged to that name before it is loaded into the node.
+  if [ "${IMAGE}" != "${DEPLOY_IMAGE}" ]; then
+    docker tag "${IMAGE}" "${DEPLOY_IMAGE}"
+  fi
+  kind load docker-image "${DEPLOY_IMAGE}" --name "${CLUSTER}"
+  kubectl config use-context "kind-${CLUSTER}"
+  apply_secret
+
+  for s in ${STACKS}; do
+    praxis-forge apply --config forge.yaml local "${s}"
+  done
+
+  # forge's praxis-deploy stack always lays down the ollama config; point it at
+  # the chosen provider afterwards rather than teaching forge about providers.
+  if [ "${PROVIDER}" != "ollama" ]; then
+    say "switching the gateway to ${PROVIDER}"
+    kubectl create configmap praxis-config --from-file="praxis.yaml=configs/${PROVIDER}.yaml" \
+      --dry-run=client -o yaml | kubectl apply -f -
+    kubectl rollout restart deployment/praxis-proxy
+    kubectl rollout status deployment/praxis-proxy --timeout=120s
+  fi
+  print_urls "${GW_PORT}" "${ADMIN}" "${PERSES}" "${PROM}" "${GRAFANA}"
+}
+
+down() {
+  say "deleting the cluster"
+  praxis-forge down --config forge.yaml
+  rm -f "${STATE_FILE}"
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: ./demo-kind <command> [provider]
+
+  up [provider]     create the cluster and deploy; provider defaults to ollama
+  verify            run the checks against whatever is up
+  urls              print the dashboard links
+  down              delete the cluster
+  forget <provider> delete that provider's stored API key
+
+Providers: ollama, openai, anthropic, openrouter.
+The provider is remembered, so verify/urls/down take no arguments.
+USAGE
+}
+
+cmd="${1:-}"
+shift || true
+
+provider="${1:-}"
+if [ -z "${provider}" ] && [ -f "${STATE_FILE}" ]; then
+  read -r provider < "${STATE_FILE}" || true
+fi
+
+case "${cmd}" in
+  forget)
+    [ -n "${provider}" ] || die "which provider? e.g. ./demo-kind forget openai"
+    resolve_provider "${provider}"
+    var="$(key_var_for "${PROVIDER}")"
+    [ -n "${var}" ] || die "${PROVIDER} does not use an API key"
+    forget_key "${var}"
+    exit 0
+    ;;
+esac
+
+resolve_provider "${provider}"
+
+case "${cmd}" in
+  up) up ;;
+  # Tempo publishes no host port here, so the trace check is skipped; the
+  # traces dashboard shows them instead.
+  verify) run_verify "${GW_PORT}" "${PROM}" ;;
+  urls) print_urls "${GW_PORT}" "${ADMIN}" "${PERSES}" "${PROM}" "${GRAFANA}" ;;
+  down) down ;;
+  '' | -h | --help | help) usage ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

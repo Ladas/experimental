@@ -1,0 +1,105 @@
+# The same gateway, pointed at OpenRouter.
+#
+# Everything that makes the demo interesting is unchanged: the request is
+# identified, budgeted, counted and traced by the same filters. Only the tail of
+# the chain differs -- OpenRouter is OpenAI-shaped but serves it under /api/v1,
+# so the path gains a prefix the client does not send.
+#
+#   ../demo-podman up openrouter      (or ../demo-kind up openrouter)
+#
+# Budgets here are per-minute and small on purpose: this config spends real
+# money, so the catch-all exists to stop a runaway agent, not to shape traffic.
+
+insecure_options:
+  # The admin listener carries /metrics for Prometheus. DEMO ONLY -- see the
+  # security note in the demo README.
+  allow_public_admin: true
+
+admin:
+  address: "0.0.0.0:9901"
+
+telemetry:
+  # Set OTEL_EXPORTER_OTLP_ENDPOINT per target; see the demo README.
+  sampling_rate: 1.0
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains: [main]
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+      - filter: access_log
+
+      # Promotes the body's `model` onto X-Model so the budget rules can match
+      # it without re-parsing the body.
+      - filter: model_to_header
+
+      - filter: token_rate_limit
+        rules:
+          # One rule per model, because match.headers is an exact match and
+          # there is no wildcard today -- see
+          # docs/2026-09-10-budget-model-switching.md in the workspace docs.
+          - name: gpt-4o
+            match:
+              headers:
+                X-Model: openai/gpt-4o
+            algorithm: sliding_window
+            window: "1m"
+            capacity: 40000
+            reserved_tokens: 2000
+            reservation_timeout: "120s"
+          # Catch-all. Without a match-less rule, anything unmatched is not
+          # limited at all -- which against a paid API is the expensive default.
+          - name: free
+            algorithm: sliding_window
+            window: "1m"
+            capacity: 10000
+            reserved_tokens: 1000
+            reservation_timeout: "120s"
+
+      - filter: token_usage_headers
+      - filter: token_count
+        provider: openai
+      - filter: time_to_first_token
+
+      # OpenRouter routes on the Host header and requires SNI, so both are set.
+      - filter: headers
+        request_set:
+          - name: Host
+            value: openrouter.ai
+
+      # Clients send /v1/chat/completions; OpenRouter serves it at
+      # /api/v1/chat/completions. Query strings are preserved.
+      - filter: path_rewrite
+        add_prefix: "/api"
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: openrouter
+
+      # Attach the key on the way out, so clients never hold it.
+      #
+      # This filter is keyed by CLUSTER, so it must run AFTER the router has
+      # selected one. Placed earlier it silently injects nothing and OpenAI
+      # replies with an authentication error.
+      #
+      # Drop the filter entirely and the client's own Authorization header
+      # passes through untouched, which is the better default when each caller
+      # brings their own key.
+      - filter: credential_injection
+        clusters:
+          - name: openrouter
+            header: Authorization
+            header_prefix: "Bearer "
+            env_var: OPENROUTER_API_KEY
+
+      - filter: load_balancer
+        clusters:
+          - name: openrouter
+            endpoints: ["openrouter.ai:443"]
+            tls:
+              sni: "openrouter.ai"

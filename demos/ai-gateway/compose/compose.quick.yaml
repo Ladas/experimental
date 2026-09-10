@@ -1,0 +1,147 @@
+# The AI gateway demo with no repository checkout.
+#
+#   podman pull ghcr.io/praxis-proxy/experimental:main
+#   id=$(podman create ghcr.io/praxis-proxy/experimental:main)
+#   podman cp "$id:/usr/share/praxis/demo/compose.yaml" compose.yaml && podman rm "$id"
+#   podman compose up -d
+#
+# Every config this stack needs is baked into the praxis image under
+# /usr/share/praxis/demo. The `seed` service lays them out into volumes that the
+# other services mount, so nothing here bind-mounts a path from your disk and
+# the dashboards can never drift from the binary they describe.
+#
+# Pick a provider with PRAXIS_PROVIDER; supply its key in the environment:
+#   PRAXIS_PROVIDER=openai OPENAI_API_KEY=sk-... podman compose up -d
+#
+# The developer flow, which does use a checkout, is ../demo-podman.
+name: praxis-ai-gateway
+
+services:
+  # Runs once, before anything else, and exits. Root because a fresh named
+  # volume is root-owned; it is the only service here that is not the demo.
+  seed:
+    image: ${PRAXIS_IMAGE:-ghcr.io/praxis-proxy/experimental:main}
+    user: "0"
+    entrypoint: ["/bin/sh", "-euc"]
+    command:
+      - |
+        src=/usr/share/praxis/demo
+        # Without this, an unknown provider dies on `cp` and every other service
+        # reports a dependency failure instead of naming the real problem.
+        if [ ! -f "$$src/configs/$$PRAXIS_PROVIDER.yaml" ]; then
+          echo "unknown PRAXIS_PROVIDER '$$PRAXIS_PROVIDER'. Available:" >&2
+          ls "$$src"/configs/ | sed 's/\.yaml$$//' | sed 's/^/  /' >&2
+          exit 1
+        fi
+        cp "$$src/configs/$$PRAXIS_PROVIDER.yaml" /out/praxis/praxis.yaml
+        cp "$$src"/stack/*.yaml /out/stack/
+        cp "$$src"/perses/config.yaml /out/perses/
+        mkdir -p /out/perses/provisioning/dashboards /out/perses/provisioning/datasources
+        cp "$$src"/perses/project.json /out/perses/provisioning/
+        cp "$$src"/perses/dashboards/*.json /out/perses/provisioning/dashboards/
+        cp "$$src"/perses/datasources/*.json /out/perses/provisioning/datasources/
+        echo "seeded provider $$PRAXIS_PROVIDER"
+    environment:
+      PRAXIS_PROVIDER: ${PRAXIS_PROVIDER:-ollama}
+    volumes:
+      - praxis-config:/out/praxis
+      - stack-config:/out/stack
+      - perses-config:/out/perses
+
+  praxis:
+    image: ${PRAXIS_IMAGE:-ghcr.io/praxis-proxy/experimental:main}
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+      - "${ADMIN_PORT:-9901}:9901"
+    volumes:
+      # WORKDIR is /etc/praxis and the server resolves praxis.yaml there.
+      - praxis-config:/etc/praxis:ro
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_SERVICE_NAME: praxis
+      # Taken from the environment compose runs in, and omitted when unset --
+      # which matters, because credential_injection fails to start on a key it
+      # cannot resolve.
+      OPENAI_API_KEY:
+      ANTHROPIC_API_KEY:
+      OPENROUTER_API_KEY:
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      otel-collector:
+        condition: service_started
+
+  otel-collector:
+    # Pinned to match the KIND target: the shared dashboards query collector
+    # self-metrics, whose names changed after 0.108.0.
+    image: otel/opentelemetry-collector-contrib:0.108.0
+    command: ["--config=/etc/stack/otel-collector.yaml"]
+    volumes:
+      - stack-config:/etc/stack:ro
+    ports:
+      - "${COLLECTOR_METRICS_PORT:-8888}:8888"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      tempo:
+        condition: service_started
+
+  tempo:
+    image: grafana/tempo:2.8.1
+    command: ["-config.file=/etc/stack/tempo.yaml"]
+    volumes:
+      - stack-config:/etc/stack:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "${TEMPO_PORT:-3200}:3200"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/stack/prometheus.yaml
+      # Tempo's metrics generator remote-writes span metrics here, which is what
+      # the span-derived dashboard panels query.
+      - --web.enable-remote-write-receiver
+    volumes:
+      - stack-config:/etc/stack:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+  perses:
+    image: persesdev/perses:v0.51.0
+    command: ["--config=/etc/perses/demo/config.yaml"]
+    volumes:
+      # Mounted at the demo subtree, never at /etc/perses: that would hide the
+      # image's plugins-archive and Perses would provision nothing while still
+      # answering 200.
+      - perses-config:/etc/perses/demo:ro
+      - perses-data:/perses
+    ports:
+      - "${PERSES_PORT:-8081}:8080"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      prometheus:
+        condition: service_healthy
+      tempo:
+        condition: service_started
+
+volumes:
+  praxis-config:
+  stack-config:
+  perses-config:
+  tempo-data:
+  prometheus-data:
+  perses-data:

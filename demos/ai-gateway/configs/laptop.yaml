@@ -1,0 +1,105 @@
+# Defaults for running the gateway on your own machine. Ready to use as-is:
+#
+#   podman run --rm -p 127.0.0.1:8080:8080 <image> \
+#     -c /usr/share/praxis/demo/configs/laptop.yaml
+#
+# No auth, because nothing but you can reach the port. Admin on loopback, so
+# /metrics never leaves the container. Fronts Ollama on this machine.
+#
+# For a server, use configs/server.yaml instead -- it has auth on. For a
+# different upstream, take the cluster and credential blocks from
+# configs/<provider>.yaml. The four provider configs are the demo-stack posture
+# and turn on allow_public_admin so Prometheus can scrape from another
+# container; nothing here does that.
+#
+# See docs/quickstart.md.
+
+insecure_options:
+  # host.docker.internal resolves to a private address, which praxis rejects by
+  # default as SSRF hardening. Remove this when pointing at a provider over TLS.
+  allow_private_endpoints: true
+
+admin:
+  # Loopback, so /healthy and /metrics are reachable from inside the container
+  # only. On a server this is what you want: run a collector agent on the host
+  # that scrapes 127.0.0.1:9901 and pushes out, rather than opening the port.
+  #   podman exec <container> curl -s http://127.0.0.1:9901/metrics
+  address: "127.0.0.1:9901"
+
+telemetry:
+  # No otlp_endpoint: nothing is exported unless you set
+  # OTEL_EXPORTER_OTLP_ENDPOINT, which praxis-core reads when this key is absent.
+  # Keep every trace -- at a handful of requests a minute, sampling would leave
+  # the span-derived views with nothing to say.
+  sampling_rate: 1.0
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains: [main]
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+      - filter: access_log
+
+      # No basic_auth here on purpose: the port is bound to 127.0.0.1, so the
+      # only thing that can reach it is you. configs/server.yaml has it on.
+
+      # Promotes the body's `model` onto X-Model so budget rules can match it
+      # without re-parsing the body, and without the client sending a header --
+      # which no coding agent lets you do.
+      - filter: model_to_header
+
+      # NOTE ON ORDER: this and token_usage_headers must be declared BEFORE
+      # token_count. Response hooks run in reverse declared order, and both
+      # read the `token.*` metadata that token_count writes in its
+      # response-body phase. Declared after, the limiter runs first, finds
+      # nothing, and charges every request its flat estimate -- metrics that
+      # look plausible and are wrong.
+      - filter: token_rate_limit
+        backend:
+          kind: memory
+        rules:
+          # One rule per model, because match.headers is an exact string and
+          # there is no wildcard. Sized for one person working for a day: a
+          # trivial Codex turn costs ~9,000 tokens, so 10M is ~1,000 turns.
+          # See docs/budgets.md before changing these.
+          - name: agent-daily
+            match:
+              headers:
+                X-Model: qwen3.8:27b
+            algorithm: sliding_window
+            window: "24h"
+            capacity: 10000000
+            reserved_tokens: 10000
+            # A 27B turn takes 34-78s; the default 30s reservation_timeout would
+            # reap the reservation as orphaned before the response lands.
+            reservation_timeout: "300s"
+          # The catch-all. Without a match-less rule, anything unmatched is not
+          # limited at all.
+          - name: default
+            algorithm: sliding_window
+            window: "1m"
+            capacity: 20000
+            reserved_tokens: 200
+
+      - filter: token_usage_headers
+      - filter: token_count
+        provider: openai
+      - filter: time_to_first_token
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: model
+
+      # No credential_injection: Ollama needs no key. For a hosted provider,
+      # copy the block from configs/openai.yaml -- it must stay AFTER router,
+      # because it is keyed by the cluster the router selected.
+
+      - filter: load_balancer
+        clusters:
+          - name: model
+            endpoints: ["host.docker.internal:11434"]

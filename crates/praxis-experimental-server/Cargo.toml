@@ -46,7 +46,13 @@ praxis-experimental-filters = { path = "../praxis-experimental-filters" }
 # Praxis core (crates.io) — for constructing the SubRequestClient that
 # `build_full_registry` requires. Keep the 0.5.x line in lockstep with the
 # git-pinned praxis-ai-proxy crate below so `FilterRegistry` unifies.
-praxis-filter = { version = "0.5.4", package = "praxis-proxy-filter" }
+# basic-auth-filter is off by default upstream. Without it the image cannot
+# authenticate a client at all -- a config using `basic_auth` dies with
+# "unknown filter type" -- so a gateway on anything but loopback has no way to
+# refuse a stranger. See demos/ai-gateway/docs/deployment.md.
+praxis-filter = { version = "0.5.4", package = "praxis-proxy-filter", features = [
+  "basic-auth-filter",
+] }
 praxis-core = { version = "0.5.4", package = "praxis-proxy-core" }
 # praxis-ai-proxy's server constructs AdminEndpointOptions, which
 # praxis-proxy-protocol gates behind its `admin-api` feature without

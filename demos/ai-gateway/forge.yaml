@@ -22,12 +22,19 @@ spec:
           container: 30300    # Grafana
         - host: 39090
           container: 30909    # Prometheus
+        # 33001 keeps Perses beside Grafana in the UI range. Deliberately NOT
+        # 38081: that port is commonly used for a second praxis gateway pointed
+        # at OpenAI, and a coding agent configured against it would silently get
+        # a dashboard instead of a gateway.
+        - host: 33001
+          container: 30081    # Perses
       stacks:
         - prometheus
         - tempo
         - otel-collector
         - praxis-deploy
         - dashboards
+        - perses
       properties:
         # Pin chart versions for reproducibility
         kubePrometheusVersion: "72.6.3"
@@ -166,7 +173,7 @@ spec:
       description: Deploy Praxis pointed at the host's Ollama
       steps:
         - type: exec
-          command: [bash, -c, "kubectl --context kind-ai-gw-local create configmap praxis-config --from-file=praxis.yaml=configs/token-budget.yaml -n default --dry-run=client -o yaml | kubectl --context kind-ai-gw-local apply -f -"]
+          command: [bash, -c, "kubectl --context kind-ai-gw-local create configmap praxis-config --from-file=praxis.yaml=configs/ollama.yaml -n default --dry-run=client -o yaml | kubectl --context kind-ai-gw-local apply -f -"]
         - type: manifest
           path: manifests/praxis.yaml
         - type: manifest
@@ -184,3 +191,25 @@ spec:
           command: [bash, -c, "kubectl --context kind-ai-gw-local -n monitoring create configmap praxis-dashboards --from-file=stacks/observability/dashboards/ --dry-run=client -o yaml | kubectl --context kind-ai-gw-local apply -f -"]
         - type: exec
           command: [kubectl, --context, kind-ai-gw-local, -n, monitoring, label, configmap, praxis-dashboards, grafana_dashboard=1, --overwrite]
+
+    perses:
+      description: Perses reading the same dashboards as the compose target
+      steps:
+        # Four ConfigMaps rather than one: the project and dashboards are shared
+        # with the compose target byte-for-byte, while the datasource URLs are
+        # KIND's own -- which is the only thing that differs between targets.
+        - type: exec
+          command: [bash, -c, "kubectl --context kind-ai-gw-local -n monitoring create configmap perses-config --from-file=observability/perses/config.yaml --dry-run=client -o yaml | kubectl --context kind-ai-gw-local apply -f -"]
+        - type: exec
+          command: [bash, -c, "kubectl --context kind-ai-gw-local -n monitoring create configmap perses-project --from-file=observability/perses/project.json --dry-run=client -o yaml | kubectl --context kind-ai-gw-local apply -f -"]
+        - type: exec
+          command: [bash, -c, "kubectl --context kind-ai-gw-local -n monitoring create configmap perses-dashboards --from-file=observability/perses/dashboards/ --dry-run=client -o yaml | kubectl --context kind-ai-gw-local apply -f -"]
+        - type: exec
+          command: [bash, -c, "kubectl --context kind-ai-gw-local -n monitoring create configmap perses-datasources --from-file=observability/perses/datasources/kind/ --dry-run=client -o yaml | kubectl --context kind-ai-gw-local apply -f -"]
+        - type: manifest
+          path: manifests/perses.yaml
+        - type: wait
+          resource: deployment/perses
+          namespace: monitoring
+          condition: available
+          timeout: "120s"

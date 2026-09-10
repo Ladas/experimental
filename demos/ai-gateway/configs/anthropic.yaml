@@ -1,0 +1,119 @@
+# The same gateway, pointed at the Anthropic API.
+#
+# Unlike the other hosted configs this one is NOT OpenAI-shaped. Anthropic
+# serves /v1/messages with its own request and response bodies, and praxis does
+# not translate between the two wire formats. So the client must speak Anthropic
+# too -- which Claude Code does, via ANTHROPIC_BASE_URL. An OpenAI-shaped client
+# pointed here gets a 404 from Anthropic, not an error from praxis.
+#
+#   ../demo-podman up anthropic      (or ../demo-kind up anthropic)
+#
+# Budgets here are per-minute and small on purpose: this config spends real
+# money, so the catch-all exists to stop a runaway agent, not to shape traffic.
+
+insecure_options:
+  # The admin listener carries /metrics for Prometheus. DEMO ONLY -- see the
+  # security note in the demo README.
+  allow_public_admin: true
+
+admin:
+  address: "0.0.0.0:9901"
+
+telemetry:
+  # Set OTEL_EXPORTER_OTLP_ENDPOINT per target; see the demo README.
+  sampling_rate: 1.0
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains: [main]
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+      - filter: access_log
+
+      # Anthropic's body carries `model` in the same place OpenAI's does, so
+      # this promotes it onto X-Model for the budget rules either way.
+      - filter: model_to_header
+
+      - filter: token_rate_limit
+        rules:
+          # One rule per model, because match.headers is an exact match and
+          # there is no wildcard today -- see
+          # docs/2026-09-10-budget-model-switching.md in the workspace docs.
+          #
+          # Claude Code is the obvious client here, and it does NOT use one
+          # model: subagents, background tasks and the built-in Explore and
+          # Plan agents each resolve their own. Expect two to four distinct
+          # strings from a single session, so give each a rule or let the
+          # catch-all cover the rest. See docs/coding-agents.md.
+          - name: sonnet
+            match:
+              headers:
+                X-Model: claude-sonnet-4-6
+            algorithm: sliding_window
+            window: "1m"
+            capacity: 40000
+            reserved_tokens: 2000
+            reservation_timeout: "120s"
+          - name: haiku
+            match:
+              headers:
+                X-Model: claude-haiku-4-5
+            algorithm: sliding_window
+            window: "1m"
+            capacity: 40000
+            reserved_tokens: 1000
+            reservation_timeout: "120s"
+          # Catch-all. Without a match-less rule, anything unmatched is not
+          # limited at all -- which against a paid API is the expensive default.
+          - name: free
+            algorithm: sliding_window
+            window: "1m"
+            capacity: 10000
+            reserved_tokens: 1000
+            reservation_timeout: "120s"
+
+      # Normalises the anthropic-version / anthropic-beta headers for a native
+      # /v1/messages backend. It touches no body and no credentials, so it is
+      # here to make a client that omits the version header still work.
+      - filter: anthropic_messages_protocol
+
+      - filter: token_usage_headers
+      - filter: token_count
+        provider: anthropic
+      - filter: time_to_first_token
+
+      # Anthropic routes on the Host header and requires SNI, so both are set.
+      - filter: headers
+        request_set:
+          - name: Host
+            value: api.anthropic.com
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: anthropic
+
+      # Attach the key on the way out, so clients never hold it.
+      #
+      # This filter is keyed by CLUSTER, so it must run AFTER the router has
+      # selected one. Placed earlier it silently injects nothing and Anthropic
+      # replies with an authentication error.
+      #
+      # Anthropic uses x-api-key with no "Bearer " prefix, unlike every other
+      # provider here.
+      - filter: credential_injection
+        clusters:
+          - name: anthropic
+            header: x-api-key
+            env_var: ANTHROPIC_API_KEY
+
+      - filter: load_balancer
+        clusters:
+          - name: anthropic
+            endpoints: ["api.anthropic.com:443"]
+            tls:
+              sni: "api.anthropic.com"

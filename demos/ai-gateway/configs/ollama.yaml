@@ -41,7 +41,11 @@ admin:
 # metrics-generator then derives traces_spanmetrics_* from them, which is what
 # the per-filter latency dashboard queries.
 telemetry:
-  otlp_endpoint: "http://otel-collector.otel.svc:4317"
+  # No otlp_endpoint here on purpose. praxis-core falls back to the standard
+  # OTEL_EXPORTER_OTLP_ENDPOINT variable when this key is absent, which is what
+  # lets this one file serve both the KIND target (the in-cluster collector,
+  # set in manifests/praxis.yaml) and compose (Tempo directly, set in
+  # compose/compose.yaml).
   # Keep every trace. This demo runs a handful of requests per minute through a
   # local model, and the span-derived dashboards need every one of them to say
   # anything; at 0.1 they would be built from six traces. The otel-benchmark

@@ -24,6 +24,20 @@ spec:
           # bare entrypoint would resolve praxis.yaml anyway, but relying on
           # that is fragile -- state it where a reader of this manifest sees it.
           args: ["-c", "/etc/praxis/praxis.yaml"]
+          env:
+            # The config deliberately omits telemetry.otlp_endpoint so the same
+            # file also works under compose; praxis-core reads this instead.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.otel.svc:4317"
+            - name: OTEL_SERVICE_NAME
+              value: praxis
+          # Provider API keys, for the configs that use credential_injection.
+          # Optional so the Ollama path needs no Secret at all; every key in the
+          # Secret becomes an env var, so adding a provider needs no edit here.
+          envFrom:
+            - secretRef:
+                name: praxis-provider-keys
+                optional: true
           ports:
             - containerPort: 8080
               name: proxy

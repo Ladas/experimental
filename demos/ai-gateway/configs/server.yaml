@@ -1,0 +1,134 @@
+# Defaults for running the gateway on a server other machines can reach. Ready
+# to use as-is, given two environment variables:
+#
+#   podman run -d -p 8080:8080 \
+#     -e PRAXIS_AUTH_PASSWORD -e OPENAI_API_KEY \
+#     -e OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+#     <image> -c /usr/share/praxis/demo/configs/server.yaml
+#
+# Differences from configs/laptop.yaml, all of them because the port is exposed:
+#
+#   basic_auth is ON and resolved from PRAXIS_AUTH_PASSWORD. It is resolved at
+#   startup, so an unset variable stops the gateway rather than leaving it open.
+#   The upstream is OpenAI over TLS rather than a model on the host, so
+#   allow_private_endpoints is gone and credential_injection supplies the key.
+#   Admin stays on loopback: run a collector agent on the host to scrape
+#   127.0.0.1:9901, rather than setting allow_public_admin, which would also
+#   expose /api/kv and /api/log-level.
+#
+# See docs/quickstart.md.
+
+admin:
+  # Loopback, so /healthy and /metrics are reachable from inside the container
+  # only. On a server this is what you want: run a collector agent on the host
+  # that scrapes 127.0.0.1:9901 and pushes out, rather than opening the port.
+  #   podman exec <container> curl -s http://127.0.0.1:9901/metrics
+  address: "127.0.0.1:9901"
+
+telemetry:
+  # No otlp_endpoint: nothing is exported unless you set
+  # OTEL_EXPORTER_OTLP_ENDPOINT, which praxis-core reads when this key is absent.
+  # Keep every trace -- at a handful of requests a minute, sampling would leave
+  # the span-derived views with nothing to say.
+  sampling_rate: 1.0
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains: [main]
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+      - filter: access_log
+
+      # Refuses anyone without the password. strip_authorization keeps the
+      # client's header off the upstream request, which matters because
+      # credential_injection substitutes the provider key immediately after.
+      #
+      # This filter logs a warning on startup that it is experimental and stores
+      # credentials in plaintext. That is accurate: it is a gate against
+      # strangers, not a user directory, and it needs TLS in front of it because
+      # basic-auth credentials are base64, not encrypted.
+      - filter: basic_auth
+        realm: "Praxis"
+        strip_authorization: true
+        credentials:
+          - username: praxis
+            env_var: PRAXIS_AUTH_PASSWORD
+
+      # Promotes the body's `model` onto X-Model so budget rules can match it
+      # without re-parsing the body, and without the client sending a header --
+      # which no coding agent lets you do.
+      - filter: model_to_header
+
+      # NOTE ON ORDER: this and token_usage_headers must be declared BEFORE
+      # token_count. Response hooks run in reverse declared order, and both
+      # read the `token.*` metadata that token_count writes in its
+      # response-body phase. Declared after, the limiter runs first, finds
+      # nothing, and charges every request its flat estimate -- metrics that
+      # look plausible and are wrong.
+      - filter: token_rate_limit
+        backend:
+          kind: memory
+        rules:
+          # One rule per model, because match.headers is an exact string and
+          # there is no wildcard. Sized for one person working for a day: a
+          # trivial Codex turn costs ~9,000 tokens, so 10M is ~1,000 turns.
+          # See docs/budgets.md before changing these.
+          - name: gpt-4o
+            match:
+              headers:
+                X-Model: gpt-4o
+            algorithm: sliding_window
+            window: "24h"
+            # ~$50/month at $2.50 per 1M output tokens, divided across 30 days.
+            # Tokens, not money -- praxis has no cost-based limiting. See
+            # docs/budgets.md for the conversion and its caveats.
+            capacity: 660000
+            reserved_tokens: 10000
+            reservation_timeout: "120s"
+          # The catch-all. Without a match-less rule, anything unmatched is not
+          # limited at all.
+          # The catch-all matters more here than on a laptop: against a paid
+          # provider, an unmatched model with no rule is unlimited spend.
+          - name: default
+            algorithm: sliding_window
+            window: "24h"
+            capacity: 200000
+            reserved_tokens: 2000
+            reservation_timeout: "120s"
+
+      - filter: token_usage_headers
+      - filter: token_count
+        provider: openai
+      - filter: time_to_first_token
+
+      # OpenAI routes on the Host header and requires SNI, so both are set.
+      - filter: headers
+        request_set:
+          - name: Host
+            value: api.openai.com
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: model
+
+      # AFTER router, always: this filter is keyed by the cluster the router
+      # selected, so placed earlier it injects nothing and the provider reports
+      # a missing key with no error from praxis.
+      - filter: credential_injection
+        clusters:
+          - name: model
+            header: Authorization
+            header_prefix: "Bearer "
+            env_var: OPENAI_API_KEY
+
+      - filter: load_balancer
+        clusters:
+          - name: model
+            endpoints: ["api.openai.com:443"]
+            tls:
+              sni: "api.openai.com"
