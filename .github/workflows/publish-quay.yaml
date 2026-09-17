@@ -140,7 +140,9 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPOSITORY }}
             org.opencontainers.image.revision=${{ needs.resolve.outputs.upstream_sha }}
           layers: true
-          oci: true
+          # Buildah ignores Containerfile HEALTHCHECK in OCI-format output.
+          # Docker-v2 preserves it for standalone Podman/RHEL consumers.
+          oci: false
           squash: false
 
       - name: Log in to Quay
@@ -213,23 +215,44 @@ jobs:
           fi
           echo "ref=${IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
 
-      - name: Start container by digest
+      - name: Start container by digest as an arbitrary UID
         run: |
           podman run --detach --name praxis-ci \
+            --cap-drop all \
             --publish 8080:8080 \
-            --volume "$GITHUB_WORKSPACE/examples/configs/minimal.yaml:/etc/praxis/praxis.yaml:ro" \
+            --security-opt no-new-privileges \
+            --user 10001:0 \
+            --volume "$GITHUB_WORKSPACE/examples/configs/minimal.yaml:/etc/praxis/praxis.yaml:ro,Z" \
             "${{ steps.image.outputs.ref }}"
 
-      - name: Run the image health check
+      - name: Wait for the embedded Podman health check
         run: |
           for _ in $(seq 1 30); do
             if podman healthcheck run praxis-ci; then
-              echo "container healthy"
+              echo "container is healthy"
               exit 0
             fi
             sleep 2
           done
-          echo "timed out waiting for a successful health check" >&2
+          podman inspect --format '{{json .State.Health}}' praxis-ci || true
+          echo "timed out waiting for the embedded health check" >&2
+          exit 1
+
+      - name: Check readiness through an exec probe
+        run: |
+          for _ in $(seq 1 30); do
+            if podman exec praxis-ci \
+              curl --fail --silent --output /dev/null \
+              http://127.0.0.1:9901/ready; then
+              echo "container is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          podman exec praxis-ci \
+            curl --fail --silent --show-error --output /dev/null \
+            http://127.0.0.1:9901/ready || true
+          echo "timed out waiting for the internal readiness endpoint" >&2
           exit 1
 
       - name: Check the gateway serves traffic
@@ -285,9 +308,9 @@ jobs:
           done
 
           buildah manifest inspect "$manifest"
-          buildah manifest push --all "$manifest" \
+          buildah manifest push --all --format v2s2 "$manifest" \
             "docker://${IMAGE}:sha-${SHORT_SHA}"
-          buildah manifest push --all "$manifest" \
+          buildah manifest push --all --format v2s2 "$manifest" \
             "docker://${IMAGE}:main"
           podman manifest inspect "${IMAGE}:sha-${SHORT_SHA}"
 
