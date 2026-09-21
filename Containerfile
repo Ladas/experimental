@@ -22,11 +22,11 @@
 
 FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:9295c5c688f487fa5cf27a734fa55ecd57aeb7dc0904ba537da4f42dfa1d0acb AS builder
 
-# No openssl-devel: the binary links rustls, so nothing in the graph builds
-# against system OpenSSL. Verified with ldd on the produced binary.
+# Praxis AI's default PostgreSQL store uses SQLx with native TLS, so the build
+# needs OpenSSL headers. The runtime library is already supplied by UBI minimal.
 RUN dnf upgrade -y --nodocs --setopt=install_weak_deps=0 \
     && dnf install -y --nodocs --setopt=install_weak_deps=0 \
-        gcc cmake make xz \
+        gcc cmake make openssl-devel xz \
     && dnf clean all
 
 # Hermeto's cargo prefetch vendors against the sparse index; matching the

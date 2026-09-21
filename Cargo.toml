@@ -6,8 +6,6 @@ members = [
   "crates/praxis-experimental-server",
 ]
 
-# Use praxis main for OTel features not yet in the v0.5.3 crates.io release
-
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -21,6 +19,32 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
 proptest = "1.11.0"
+
+# Pin the AI snapshot and its Praxis core source together. Cargo includes the
+# Git reference kind in package identity, so every consumer must inherit these
+# exact revisions rather than restating an equivalent version or tag.
+[workspace.dependencies.praxis-ai-build-support]
+git = "https://github.com/praxis-proxy/ai"
+rev = "8a0b4954234cb01170d728e206dd82dc70439237"
+
+[workspace.dependencies.praxis-ai-proxy]
+git = "https://github.com/praxis-proxy/ai"
+rev = "8a0b4954234cb01170d728e206dd82dc70439237"
+
+[workspace.dependencies.praxis-core]
+git = "https://github.com/praxis-proxy/praxis"
+package = "praxis-proxy-core"
+rev = "500de65d1c3f38ce900297805f70298c8af20a56"
+
+[workspace.dependencies.praxis-filter]
+git = "https://github.com/praxis-proxy/praxis"
+package = "praxis-proxy-filter"
+rev = "500de65d1c3f38ce900297805f70298c8af20a56"
+
+[workspace.dependencies.praxis-protocol]
+git = "https://github.com/praxis-proxy/praxis"
+package = "praxis-proxy-protocol"
+rev = "500de65d1c3f38ce900297805f70298c8af20a56"
 
 [profile.release]
 lto = true
