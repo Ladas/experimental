@@ -798,6 +798,8 @@ mod tests {
             request_headers_to_remove: Vec::new(),
             request_headers_to_set: Vec::new(),
             filter_metadata: std::collections::HashMap::new(),
+            grpc_completion: None,
+            prior_pre_read_mutations: Vec::new(),
             pre_read_mutations: Vec::new(),
             structured_metadata: std::collections::HashMap::new(),
             filter_results: std::collections::HashMap::new(),
@@ -816,6 +818,7 @@ mod tests {
             response_body_mode: BodyMode::Stream,
             response_header: None,
             response_headers_modified: false,
+            upstream_reached: false,
             selected_endpoint_index: None,
             attempted_endpoints: Vec::new(),
             retry_policy: None,
@@ -993,6 +996,7 @@ mod tests {
 
     /// A subrequest client suitable for judge callouts in tests.
     fn make_client() -> SubRequestClient {
+        praxis_tls::provider::install();
         SubRequestClient::new(SubRequestConnector::new(2, None))
     }
 

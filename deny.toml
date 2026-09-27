@@ -44,7 +44,8 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # praxis-ai crates are publish = false and only consumable as git dependencies;
-# praxis-experimental-server pins them to an exact rev.
+# praxis-experimental-server pins them to a release tag and Cargo.lock records
+# the resolved commit.
 # praxis-proxy/ai: praxis-ai crates are publish = false (git only).
-# praxis-proxy/praxis: patched to main for otel features not yet in v0.5.3.
+# Praxis core is consumed from crates.io at the version selected above.
 allow-git = ["https://github.com/praxis-proxy/ai"]
