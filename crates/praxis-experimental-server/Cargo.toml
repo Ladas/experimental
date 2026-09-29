@@ -23,9 +23,16 @@ otel = ["praxis-core/otel", "praxis-filter/otel", "praxis-ai-proxy/opentelemetry
 #  - praxis-experimental-filters is consumed by the discovery build script (its presence
 #    as a direct dep, carrying the praxis-filters marker, is the point).
 #  - praxis-ai-proxy is used as `praxis_ai::...` (lib name differs from package).
+#  - praxis-core is used for `otel` feature forwarding.
 #  - praxis-filter is referenced only in build-script-generated code.
 [package.metadata.cargo-machete]
-ignored = ["praxis-experimental-filters", "praxis-ai-proxy", "praxis-filter", "praxis-protocol"]
+ignored = [
+  "praxis-core",
+  "praxis-experimental-filters",
+  "praxis-ai-proxy",
+  "praxis-filter",
+  "praxis-protocol",
+]
 
 [[bin]]
 name = "praxis-experimental-server"
@@ -43,14 +50,13 @@ tracing.workspace = true
 # `[package.metadata.praxis-filters]` marker.
 praxis-experimental-filters = { path = "../praxis-experimental-filters" }
 
-# Praxis core (crates.io) — for constructing the SubRequestClient that
-# `build_full_registry` requires. Keep the 0.5.x line in lockstep with the
-# git-pinned praxis-ai-proxy crate below so `FilterRegistry` unifies.
+# Praxis core, kept on the released version used by the pinned AI release so
+# `SubRequestClient`, `Config`, and `FilterRegistry` share one Rust type graph.
 # basic-auth-filter is off by default upstream, so a config naming `basic_auth`
 # dies with "unknown filter type". It is the cheap gate for a human-driven client
 # on a shared host; it is NOT usable in front of a coding agent, which sends its
 # own Authorization header and would collide. See docs/quickstart.md.
-praxis-filter = { version = "0.5.4", package = "praxis-proxy-filter", features = [
+praxis-filter = { workspace = true, features = [
   "basic-auth-filter",
   # The Praxis Policy Engine, off by default upstream. It is the only thing in
   # this image that can validate a per-caller credential: multi-source JWT
@@ -59,25 +65,31 @@ praxis-filter = { version = "0.5.4", package = "praxis-proxy-filter", features =
   # key. See demos/ai-gateway/docs/quickstart.md.
   "policy-engine",
 ] }
-praxis-core = { version = "0.5.4", package = "praxis-proxy-core" }
+# This direct dependency forwards this crate's `otel` feature to Core. Runtime
+# construction uses the stock AI helper below rather than duplicating Core APIs.
+praxis-core.workspace = true
 # praxis-ai-proxy's server constructs AdminEndpointOptions, which
 # praxis-proxy-protocol gates behind its `admin-api` feature without
 # enabling it itself. Declaring it here lets Cargo feature unification
 # turn it on for the whole graph. Not referenced from our own code.
-praxis-protocol = { version = "0.5.4", package = "praxis-proxy-protocol", features = ["admin-api"] }
+praxis-protocol = { workspace = true, features = ["admin-api"] }
 
 # The stock praxis-ai server. praxis-ai crates are `publish = false`, so this
-# stays a git dependency; pinned to a release tag rather than a floating rev.
+# stays a git dependency pinned to its v0.4.1 release tag.
+#
+# AI now defaults to its smaller `standard` feature set. `full` explicitly
+# preserves the pre-split image surface: OpenAI Responses, Conversations,
+# compaction, MCP tools, file resolution, and the PostgreSQL response store.
 #
 # `http-callout-filter` is off by default upstream because its config surface is
 # still moving. This image exists to expose experimental work, so it is on here
 # — it is what backs the Lakera Guard example config.
-praxis-ai-proxy = { git = "https://github.com/praxis-proxy/ai", tag = "v0.3.0", features = [
+praxis-ai-proxy = { workspace = true, features = [
+  "full",
   "token-rate-limit-filter",
   "http-callout-filter",
-  "praxis-main",
 ] }
 
 [build-dependencies]
 cargo_metadata = "0.23.1"
-praxis-ai-build-support = { git = "https://github.com/praxis-proxy/ai", tag = "v0.3.0" }
+praxis-ai-build-support.workspace = true

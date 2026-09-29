@@ -8,10 +8,6 @@
 //! [`praxis_ai::run_server_with_registry`].
 
 use clap::Parser;
-use praxis_core::{
-    config::Config,
-    subrequest::{SubRequestClient, SubRequestConnector},
-};
 
 // Provides: fn register_external_filters(registry: &mut praxis_filter::FilterRegistry)
 include!(concat!(env!("OUT_DIR"), "/external_filters.rs"));
@@ -59,18 +55,6 @@ impl Cli {
     }
 }
 
-/// Builds a [`SubRequestClient`] from runtime config, mirroring praxis-ai's
-/// `create_subrequest_client` so callout behaviour matches the stock server.
-fn create_subrequest_client(config: &Config) -> SubRequestClient {
-    let pool_size = config
-        .runtime
-        .subrequest_pool_size
-        .unwrap_or(praxis_core::config::DEFAULT_SUBREQUEST_POOL_SIZE);
-    let connector = SubRequestConnector::new(pool_size, config.runtime.subrequest_max_connections);
-    let response_ceiling = config.body_limits.max_response_bytes.unwrap_or(usize::MAX);
-    SubRequestClient::with_max_response_bytes(connector, response_ceiling)
-}
-
 /// Loads config, initialises tracing, composes the registry, and runs the server.
 ///
 /// # Errors
@@ -83,6 +67,8 @@ fn create_subrequest_client(config: &Config) -> SubRequestClient {
 /// On success this does not return: [`praxis_ai::run_server_with_registry`]
 /// blocks for the lifetime of the process.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    praxis_ai::install_crypto_provider();
+
     let cli = Cli::parse();
     let explicit = cli.explicit_config();
 
@@ -104,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let subrequest_client = create_subrequest_client(&config);
+    let subrequest_client = praxis_ai::create_subrequest_client(&config);
     let mut registry = praxis_ai::build_full_registry(&subrequest_client);
     register_external_filters(&mut registry);
 

@@ -6,8 +6,6 @@ members = [
   "crates/praxis-experimental-server",
 ]
 
-# Use praxis main for OTel features not yet in the v0.5.3 crates.io release
-
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -21,6 +19,37 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
 proptest = "1.11.0"
+
+# Consume the Praxis AI v0.4.1 release tag. Its unpublished crates are only
+# consumable from Git; Cargo.lock records the tag's resolved commit. Disabling
+# defaults makes the image's capability set explicit in
+# praxis-experimental-server rather than inheriting a changing default.
+[workspace.dependencies.praxis-ai-build-support]
+git = "https://github.com/praxis-proxy/ai"
+tag = "v0.4.1"
+
+[workspace.dependencies.praxis-ai-proxy]
+git = "https://github.com/praxis-proxy/ai"
+tag = "v0.4.1"
+default-features = false
+
+# Keep direct core dependencies on the same released source and version used by
+# the pinned AI release so shared Rust types resolve to one package identity.
+[workspace.dependencies.praxis-core]
+version = "0.7.0"
+package = "praxis-proxy-core"
+
+[workspace.dependencies.praxis-filter]
+version = "0.7.0"
+package = "praxis-proxy-filter"
+
+[workspace.dependencies.praxis-protocol]
+version = "0.7.0"
+package = "praxis-proxy-protocol"
+
+[workspace.dependencies.praxis-tls]
+version = "0.7.0"
+package = "praxis-proxy-tls"
 
 [profile.release]
 lto = true
