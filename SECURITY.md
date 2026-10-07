@@ -2,12 +2,7 @@
 
 ## Supported Versions
 
-| Version | Supported  |
-| ------- | ---------- |
-| 0.1.x   | No (Alpha) |
-
-Only the latest patch release of each minor version
-receives security updates.
+This is for experimental builds, there will never be any supported versions.
 
 ## Reporting a Vulnerability
 
@@ -40,3 +35,11 @@ a standardized response timeline.
   effort, information disclosure of limited scope
 - **Low**: Issues requiring unlikely configurations or
   minimal impact
+
+## Safe Harbor
+
+We consider security research conducted in good faith to
+be authorized. We will not pursue legal action against
+researchers who follow this policy and report findings
+responsibly. We appreciate the effort you put into
+keeping this project secure.
