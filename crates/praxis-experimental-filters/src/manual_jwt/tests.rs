@@ -110,7 +110,6 @@ mod cases {
             registry_file: dir.path().join("users.json"),
             issuer: "issuer".into(),
             audience: "audience".into(),
-            allowed_origins: Vec::new(),
         })
         .unwrap();
         let signing = EncodingKey::from_rsa_pem(&std::fs::read(key).unwrap()).unwrap();
@@ -201,16 +200,11 @@ mod cases {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "sequential authentication boundary assertions")]
-    async fn listener_roles_and_spoofed_headers() {
+    async fn inference_replaces_spoofed_identity() {
         let (dir, _verifier, signing) = fixture();
         let credential = token(&signing, &serde_json::json!({}));
         register(&dir, &credential, true);
-        let make = |mode: &str| {
-            let config = serde_json::json!({"mode":mode,"public_key_file":dir.path().join("public.pem"),"registry_file":dir.path().join("users.json"),"issuer":"issuer","audience":"audience","allowed_origins":["https://gateway.test"]});
-            ManualJwtFilter::from_config(&serde_yaml::to_value(config).unwrap()).unwrap()
-        };
-        let inference = make("inference");
+        let inference = make_filter(&dir, "inference");
         assert_eq!(inference.name(), "manual_jwt", "registered name");
         assert_eq!(inference.request_body_access(), BodyAccess::None);
         let mut request = make_request("/v1/chat/completions");
@@ -237,7 +231,19 @@ mod cases {
         );
         request.headers.append("authorization", "Bearer other".parse().unwrap());
         assert_status(apply(inference.as_ref(), &request).await, 401);
-        let callback = make("callback");
+    }
+
+    /// POST and method denial follow [RFC 9110 Section 9.3.3] and [RFC 9110 Section 15.5.6].
+    ///
+    /// [RFC 9110 Section 9.3.3]: https://datatracker.ietf.org/doc/html/rfc9110#section-9.3.3
+    /// [RFC 9110 Section 15.5.6]: https://datatracker.ietf.org/doc/html/rfc9110#section-15.5.6
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "callback response contract assertions")]
+    async fn callback_rfc9110_method_and_validation_contract() {
+        let (dir, _verifier, signing) = fixture();
+        let credential = token(&signing, &serde_json::json!({}));
+        register(&dir, &credential, true);
+        let callback = make_filter(&dir, "callback");
         assert_eq!(
             callback.request_body_mode(),
             BodyMode::StreamBuffer {
@@ -269,9 +275,29 @@ mod cases {
         callback_context.buffered_request_body = Some(bytes::Bytes::from_static(b"broken"));
         assert_status(callback.on_request(&mut callback_context).await.unwrap(), 400);
         callback_request.method = http::Method::GET;
-        assert_status(apply(callback.as_ref(), &callback_request).await, 405);
+        let FilterAction::Reject(denial) = apply(callback.as_ref(), &callback_request).await else {
+            panic!("method must be rejected");
+        };
+        assert_eq!(denial.status, 405);
+        assert!(
+            denial
+                .headers
+                .iter()
+                .any(|(name, value)| name == "Allow" && value == "POST")
+        );
         assert_status(apply(callback.as_ref(), &make_request("/other")).await, 404);
-        let dashboard = make("dashboard");
+    }
+
+    /// Exact origin and single-header checks follow [RFC 6454 Section 4] and [RFC 6454 Section 7.3].
+    ///
+    /// [RFC 6454 Section 4]: https://datatracker.ietf.org/doc/html/rfc6454#section-4
+    /// [RFC 6454 Section 7.3]: https://datatracker.ietf.org/doc/html/rfc6454#section-7.3
+    #[tokio::test]
+    async fn dashboard_rfc6454_origin_boundary() {
+        let (dir, _verifier, signing) = fixture();
+        let credential = token(&signing, &serde_json::json!({}));
+        register(&dir, &credential, true);
+        let dashboard = make_filter(&dir, "dashboard");
         let mut browser_request = make_request("/login");
         assert_status(apply(dashboard.as_ref(), &browser_request).await, 403);
         browser_request
@@ -282,8 +308,73 @@ mod cases {
             .headers
             .insert("origin", "https://gateway.test".parse().unwrap());
         assert_continues(&apply(dashboard.as_ref(), &browser_request).await);
+        browser_request
+            .headers
+            .append("origin", "https://attacker.test".parse().unwrap());
+        assert_status(apply(dashboard.as_ref(), &browser_request).await, 403);
         browser_request.method = http::Method::GET;
         assert_continues(&apply(dashboard.as_ref(), &browser_request).await);
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "origin grammar acceptance and rejection cases")]
+    fn dashboard_origins_are_validated_during_deserialization() {
+        let base = serde_json::json!({"mode":"dashboard", "public_key_file":"unused", "registry_file":"unused",
+            "issuer":"issuer", "audience":"audience"});
+        assert!(
+            serde_json::from_value::<Config>(base.clone()).is_err(),
+            "origins are required"
+        );
+        for origins in [
+            serde_json::json!([]),
+            serde_json::json!(["https://"]),
+            serde_json::json!(["https://host/path"]),
+            serde_json::json!(["https://host/"]),
+            serde_json::json!(["https://user@host"]),
+            serde_json::json!(["https://host?query"]),
+            serde_json::json!(["https://host#fragment"]),
+            serde_json::json!(["http://host"]),
+            serde_json::json!(["null"]),
+            serde_json::json!(["https://host:invalid"]),
+            serde_json::json!(["https://host", "invalid"]),
+        ] {
+            let mut config = base.clone();
+            config
+                .as_object_mut()
+                .unwrap()
+                .insert("allowed_origins".into(), origins);
+            assert!(
+                serde_json::from_value::<Config>(config).is_err(),
+                "invalid origin accepted"
+            );
+        }
+        for origin in ["https://gateway.test", "https://localhost:8443", "https://[::1]:8443"] {
+            let mut config = base.clone();
+            config
+                .as_object_mut()
+                .unwrap()
+                .insert("allowed_origins".into(), serde_json::json!([origin]));
+            assert!(
+                serde_json::from_value::<Config>(config).is_ok(),
+                "valid origin rejected"
+            );
+        }
+    }
+
+    /// A 401 challenge is required by [RFC 9110 Section 15.5.2].
+    ///
+    /// [RFC 9110 Section 15.5.2]: https://datatracker.ietf.org/doc/html/rfc9110#section-15.5.2
+    #[test]
+    fn rfc9110_unauthorized_has_bearer_challenge() {
+        let FilterAction::Reject(response) = super::super::denied(401) else {
+            panic!("denial expected")
+        };
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name == "WWW-Authenticate" && value == "Bearer")
+        );
     }
 
     #[tokio::test]
@@ -340,6 +431,12 @@ mod cases {
                 panic!("bad trust configuration was accepted");
             };
         }
+    }
+
+    /// Build a listener mode with the same fixture trust roots.
+    fn make_filter(dir: &tempfile::TempDir, mode: &str) -> Box<dyn HttpFilter> {
+        let config = serde_json::json!({"mode":mode,"public_key_file":dir.path().join("public.pem"),"registry_file":dir.path().join("users.json"),"issuer":"issuer","audience":"audience","allowed_origins":["https://gateway.test"]});
+        ManualJwtFilter::from_config(&serde_yaml::to_value(config).unwrap()).unwrap()
     }
 
     /// Invoke a filter with an unbuffered request fixture.

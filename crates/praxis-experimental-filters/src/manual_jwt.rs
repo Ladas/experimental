@@ -35,15 +35,6 @@ impl ManualJwtFilter {
     /// Fails on malformed configuration, empty trust values or invalid public key.
     pub(crate) fn from_config(value: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let config: Config = praxis_filter::parse_filter_config("manual_jwt", value)?;
-        if config.mode == Mode::Dashboard
-            && (config.allowed_origins.is_empty()
-                || config
-                    .allowed_origins
-                    .iter()
-                    .any(|origin| !origin.starts_with("https://") || origin.ends_with('/')))
-        {
-            return Err("manual_jwt: dashboard requires explicit HTTPS origins without trailing slash".into());
-        }
         let verifier = Verifier::new(&config)?;
         Ok(Box::new(Self { config, verifier }))
     }
@@ -106,11 +97,12 @@ impl ManualJwtFilter {
     }
 
     /// Retain `PriceTag`'s cookie authentication and reject cross-origin writes.
-    fn dashboard(&self, ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    fn dashboard(ctx: &mut HttpFilterContext<'_>, origins: &config::AllowedOrigins) -> FilterAction {
         strip_identity(ctx);
         if !matches!(ctx.request.method, Method::GET | Method::HEAD | Method::OPTIONS) {
-            let origin = ctx.request.headers.get("origin").and_then(|value| value.to_str().ok());
-            if !origin.is_some_and(|value| self.config.allowed_origins.iter().any(|allowed| value == allowed)) {
+            let mut values = ctx.request.headers.get_all("origin").iter();
+            let origin = values.next().and_then(|value| value.to_str().ok());
+            if values.next().is_some() || !origin.is_some_and(|value| origins.contains(value)) {
                 return denied(403);
             }
         }
@@ -150,7 +142,12 @@ fn auth_failure(error: &AuthError) -> FilterAction {
 
 /// A generic non-cacheable failure that never echoes caller credentials.
 fn denied(status: u16) -> FilterAction {
-    FilterAction::Reject(Rejection::status(status).with_header("Cache-Control", "no-store"))
+    let response = Rejection::status(status).with_header("Cache-Control", "no-store");
+    FilterAction::Reject(match status {
+        401 => response.with_header("WWW-Authenticate", "Bearer"),
+        405 => response.with_header("Allow", "POST"),
+        _ => response,
+    })
 }
 
 #[async_trait]
@@ -160,7 +157,7 @@ impl HttpFilter for ManualJwtFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        if self.config.mode == Mode::Callback {
+        if matches!(self.config.mode, Mode::Callback) {
             BodyAccess::ReadOnly
         } else {
             BodyAccess::None
@@ -168,7 +165,7 @@ impl HttpFilter for ManualJwtFilter {
     }
 
     fn request_body_mode(&self) -> BodyMode {
-        if self.config.mode == Mode::Callback {
+        if matches!(self.config.mode, Mode::Callback) {
             BodyMode::StreamBuffer {
                 max_bytes: Some(16_384),
             }
@@ -178,10 +175,10 @@ impl HttpFilter for ManualJwtFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        match self.config.mode {
+        match &self.config.mode {
             Mode::Inference => self.inference(ctx).await,
             Mode::Callback => self.callback(ctx).await,
-            Mode::Dashboard => Ok(self.dashboard(ctx)),
+            Mode::Dashboard(origins) => Ok(Self::dashboard(ctx, origins)),
         }
     }
 }
