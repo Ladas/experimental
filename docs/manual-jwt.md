@@ -54,7 +54,8 @@ Use `mode: callback` on its private listener. For the dashboard chain, use
 Origins must use the browser’s canonical ASCII form (lowercase host, no path,
 query, fragment, credentials, trailing slash or explicit default port). Invalid
 dashboard origins fail configuration deserialization. Duplicate Origin headers
-are rejected on unsafe requests. Include HTTPS localhost explicitly if the administrator uses loopback login.
+are rejected on unsafe requests. Include HTTPS localhost explicitly if the
+administrator uses loopback login.
 The public hostname must not be inferred from an untrusted forwarded header.
 See [the listener example](../examples/configs/manual-jwt.yaml).
 
