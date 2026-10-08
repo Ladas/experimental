@@ -51,7 +51,10 @@ registry_file: /etc/praxis/users.json
 
 Use `mode: callback` on its private listener. For the dashboard chain, use
 `mode: dashboard` and `allowed_origins: ["https://gateway.example:8443"]`.
-Include HTTPS localhost explicitly if the administrator uses loopback login.
+Origins must use the browser’s canonical ASCII form (lowercase host, no path,
+query, fragment, credentials, trailing slash or explicit default port). Invalid
+dashboard origins fail configuration deserialization. Duplicate Origin headers
+are rejected on unsafe requests. Include HTTPS localhost explicitly if the administrator uses loopback login.
 The public hostname must not be inferred from an untrusted forwarded header.
 See [the listener example](../examples/configs/manual-jwt.yaml).
 
@@ -116,6 +119,49 @@ USD budgets remain metering's responsibility. The companion deployment retains
 its upstream 10-billion-token monthly safety net and removes the separate Praxis
 `token_rate_limit` filter. Authentication failures are distinct from spending
 or request-rate denials.
+
+## Deployment responsibilities and remaining limitations
+
+- **Bearer possession grants access.** Non-expiring tokens have no automatic
+  recovery from theft. They are not bound to a device, IP or TLS client key.
+  Keep issuer keys and token files private; do not log authorization headers,
+  callback bodies, login forms or cookies. Rotation admits one token per subject;
+  there is no overlap period or separate device credentials for that subject.
+- **Listener isolation is mandatory.** The filter does not configure TLS,
+  firewall rules, route allowlists or request-rate limits. Put inference auth
+  first in an unconditional chain; forward its sanitized request to accounting.
+  Do not place another identity-setting filter after it. The callback authenticates
+  the submitted token, not the calling service, and exposes no account-management
+  API. Keep it accessible only to trusted metering. A private HTTP callback trusts
+  the host/container network; use authenticated transport if crossing hosts.
+  Metering’s login HTTP client follows redirects, so keep the callback URL
+  administrator-controlled and non-redirecting.
+- **Dashboard mode is not JWT authentication or a complete CSRF/XSS defense.**
+  Origin checks reject cross-origin writes, but metering must verify session cookies
+  and authorize every route. Non-browser clients can forge Origin; it is not a
+  credential. Keep state-changing GET endpoints and unused administrative APIs
+  out of the public route allowlist. Identity headers are an explicit fixed list;
+  changing metering’s trusted header names requires reviewing that list.
+- **Revocation is admission-time only.** Requests already admitted may finish.
+  Cookies remain valid as described above, including administrator sessions.
+  There is no per-user emergency browser logout, MFA, SSO or automatic expiry
+  of manually issued credentials.
+- **Registry integrity is a host responsibility.** The file contains hashes,
+  not secrets, but a writable or rolled-back registry can re-enable a previously
+  issued token. Serialize writers, use atomic replacement and protect backups.
+  This is one local registry, not distributed revocation: replicas need consistent
+  updates. Every JWT authentication performs signature verification and a bounded
+  registry read; rate-limit public traffic and monitor filesystem failures.
+- **Budgets and upstream behavior are separate.** This filter does not reserve
+  money, guarantee usage delivery or manage models. Metering’s cached checks and
+  in-flight requests can overshoot USD limits. Its API/UI compatibility must be
+  qualified at a pinned revision; newer metering releases may change dashboard
+  access and quota administration independently of this authentication contract.
+
+The companion deployment covers routing and accounting integration. Unit tests
+here assert filter decisions and queued header mutations; they cannot prove that
+an arbitrary deployment applies those mutations before metering or keeps private
+ports inaccessible. Qualify the final image and configuration together.
 
 ## Validation and image delivery
 
