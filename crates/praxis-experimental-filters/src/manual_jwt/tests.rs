@@ -84,6 +84,7 @@ mod cases {
         }
     }
 
+    /// Isolate each test's signing key, trust root and credential registry.
     fn fixture() -> (tempfile::TempDir, Verifier, EncodingKey) {
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("private.pem");
@@ -116,6 +117,7 @@ mod cases {
         (dir, verifier, signing)
     }
 
+    /// Sign default claims with overrides for individual validation cases.
     fn token(signing: &EncodingKey, extra: &serde_json::Value) -> String {
         let mut claims = serde_json::json!({"iss":"issuer","aud":"audience","sub":"alice","iat":jsonwebtoken::get_current_timestamp(),"jti":"one"});
         claims
@@ -125,6 +127,7 @@ mod cases {
         jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, signing).unwrap()
     }
 
+    /// Replace the fixture registry to exercise credential activation and revocation.
     fn register(dir: &tempfile::TempDir, token: &str, active: bool) {
         let registry = serde_json::json!({"version":1,"users":{"alice":{"digest":hex::encode(Sha256::digest(token.as_bytes())),"active":active}}});
         std::fs::write(dir.path().join("users.json"), registry.to_string()).unwrap();
@@ -283,7 +286,8 @@ mod cases {
             denial
                 .headers
                 .iter()
-                .any(|(name, value)| name == "Allow" && value == "POST")
+                .any(|(name, value)| name == "Allow" && value == "POST"),
+            "405 callback response must advertise Allow: POST"
         );
         assert_status(apply(callback.as_ref(), &make_request("/other")).await, 404);
     }
@@ -373,7 +377,8 @@ mod cases {
             response
                 .headers
                 .iter()
-                .any(|(name, value)| name == "WWW-Authenticate" && value == "Bearer")
+                .any(|(name, value)| name == "WWW-Authenticate" && value == "Bearer"),
+            "401 response must include WWW-Authenticate: Bearer"
         );
     }
 

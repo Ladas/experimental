@@ -41,12 +41,12 @@ switchyard-libsy = "=0.2.0"
 switchyard-protocol = "=0.2.0"
 switchyard-translation = "=0.2.0"
 
-jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
-sha2 = "0.10.9"
-hex = "0.4.3"
-url = "2.5.8"
+jsonwebtoken = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.27.0"
+tempfile = { workspace = true }
 praxis-tls.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
